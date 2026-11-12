@@ -7,6 +7,31 @@ same process.
 
 Based on upstream touchHLE `ca1de89` (v0.3.0-11), cloned to `touchHLE/`.
 
+## Status, 2026-11-13 (static work done; nothing has run on the device)
+
+| Piece | Where | State |
+| --- | --- | --- |
+| Kernel: user mappings from 0x1000 (`CONFIG_ARM_LOW_USER_MAPPINGS`) | linux-s5l87xx branch `n72-low-user-map` 18333c8c6 (worktree `linux-lowmap`) | Built on kernel #21's config (zImage in the session scratchpad); device test `alpine-work/lowmap-test/lowtest` pending; merge into n72 is the user's call |
+| Fork: features `cpu-dynarmic`/`cpu-native`, native backend, identity-mapped Mem, gates in dyld, fixed portrait panel, evdev accelerometer, `--n72-native-selftest` | touchHLE branch `n72-native` fd7b839 | `cargo check` clean; release build links (12.5 MB, EXEC at 0x70000000); gate assembly checked by disassembly. Not run. The cpu-dynarmic build was not re-checked (needs the dynarmic submodule) |
+| n72-gles: `GL_OES_framebuffer_object` (+ rgb8_rgba8, depth24), y-up FBO targets | n72-gles ec2e835 | 25 new host checks; ARM build clean. Not run on the MBX |
+| n72-gles: `GL_EXT_texture_format_BGRA8888` | n72-gles fc78e04 | host test; ARM build clean |
+
+Build the fork: `. n72/env.sh && cargo build --release --target
+arm-unknown-linux-musleabihf --no-default-features --features cpu-native`
+(needs `alpine-work/sysroot-armhf`, exported from the n72-alpine image with
+sdl2-dev, openal-soft-dev and g++, then pruned). On the device it needs
+Alpine's `sdl2`, `openal-soft-libs`, `libstdc++` and `libgcc`, plus the
+new n72-gles.
+
+First device steps, in order:
+1. Kexec the low-mappings kernel and run `lowtest` (then back to #21).
+2. `touchHLE --n72-native-selftest`: ARM and Thumb host calls, resume PC,
+   VFP preservation, null fault, udf, bkpt (expects SIGTRAP: unverified
+   that Linux reports BKPT that way), preemption, host-call cost.
+3. Install the new n72-gles, check `GL_EXTENSIONS`, run an FBO demo on
+   the MBX (render target memory, the uncached texture path).
+4. touchHLE's app picker, then TestApp.
+
 ## 0. Ground rules for the fork
 
 - **Private fork, never upstreamed.** touchHLE's CONTRIBUTING.md forbids
@@ -190,7 +215,7 @@ of `objc_msgSend` and GL calls.
 Test programs are in the session scratchpad (`risk-tests/`, `corotest/`).
 Alpine's `sdl2` and `openal-soft-libs` are now installed on the device.
 
-1. **FBO in libn72gles: CONFIRMED GAP. Work item, not a blocker.**
+1. **FBO in libn72gles: CONFIRMED GAP, now implemented (n72-gles ec2e835, host-tested only).**
    - On the device, `GL_EXTENSIONS` = `GL_OES_read_format
      GL_OES_point_size_array`, and `glGenFramebuffersOES` is NULL.
      `glCompressedTexImage2D` rejects every format.
