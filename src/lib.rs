@@ -45,6 +45,8 @@ mod licenses;
 mod mach_o;
 mod matrix;
 mod mem;
+#[cfg(feature = "cpu-native")]
+mod n72_accel;
 mod objc;
 mod options;
 mod paths;
@@ -114,7 +116,17 @@ Special options:
         Print basic information about the app bundle without running the app.
 ";
 
-pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+pub fn main<T: Iterator<Item = String>>(#[allow(unused_mut)] mut args: T) -> Result<(), String> {
+    // n72 fork: `touchHLE --n72-native-selftest` checks the native CPU
+    // backend on the device without an app.
+    #[cfg(feature = "cpu-native")]
+    let mut args = {
+        let args_vec: Vec<String> = args.collect();
+        if args_vec.iter().any(|a| a == "--n72-native-selftest") {
+            std::process::exit(cpu::native_selftest::run_selftest());
+        }
+        args_vec.into_iter()
+    };
     echo!(
         "touchHLE {}{}{} — https://touchhle.org/",
         branding(),

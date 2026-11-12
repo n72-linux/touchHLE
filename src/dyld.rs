@@ -196,10 +196,6 @@ fn search_lists<T>(
         .find(|&(sym, _)| *sym == symbol)
 }
 
-fn encode_a32_svc(imm: u32) -> u32 {
-    assert!(imm & 0xff000000 == 0);
-    imm | 0xef000000
-}
 fn encode_a32_ret() -> u32 {
     0xe12fff1e
 }
@@ -208,16 +204,13 @@ fn encode_a32_trap() -> u32 {
 }
 
 fn write_return_to_host_routine(mem: &mut Mem, svc: u32) -> GuestFunction {
-    let routine = [
-        encode_a32_svc(svc),
-        // When a return-to-host occurs, it's the host's responsibility
-        // to reset the PC to somewhere else. So something has gone
-        // wrong if this is executed.
-        encode_a32_trap(),
-    ];
-    let ptr: MutPtr<u32> = mem.alloc(4 * 2).cast();
-    mem.write(ptr + 0, routine[0]);
-    mem.write(ptr + 1, routine[1]);
+    // svc, then (when a return-to-host occurs, it's the host's
+    // responsibility to reset the PC to somewhere else, so something has gone
+    // wrong if this is executed) a trap. The call site is written by
+    // crate::cpu::write_svc so that it also works with the native backend.
+    let ptr: MutPtr<u32> = Ptr::from_bits(crate::cpu::alloc_code(mem, 4 * 2));
+    mem.write(ptr + 1, encode_a32_trap());
+    crate::cpu::write_svc(mem, ptr.to_bits(), svc);
     let ptr = GuestFunction::from_addr_with_thumb_bit(ptr.to_bits());
     assert!(!ptr.is_thumb());
     ptr
@@ -445,10 +438,10 @@ impl Dyld {
             // For convenience, make the stub return once the SVC is done
             // (Otherwise we have to manually update the PC)
             if entry_size == 4 {
-                mem.write(ptr + 0, encode_a32_svc(Self::SVC_LAZY_LINK_RET_FLAG));
+                crate::cpu::write_svc(mem, ptr.to_bits(), Self::SVC_LAZY_LINK_RET_FLAG);
             } else {
-                mem.write(ptr + 0, encode_a32_svc(Self::SVC_LAZY_LINK));
                 mem.write(ptr + 1, encode_a32_ret());
+                crate::cpu::write_svc(mem, ptr.to_bits(), Self::SVC_LAZY_LINK);
             }
             if entry_size == 16 {
                 // This is preceded by a return instruction, so if we do execute
@@ -773,7 +766,7 @@ impl Dyld {
 
             // Rewrite stub function to call this host function
             let stub_function_ptr: MutPtr<u32> = Ptr::from_bits(svc_pc);
-            mem.write(stub_function_ptr, encode_a32_svc(svc));
+            crate::cpu::write_svc(mem, stub_function_ptr.to_bits(), svc);
             if info.entry_size != 4 {
                 assert!(mem.read(stub_function_ptr + 1) == encode_a32_ret());
             }
@@ -859,10 +852,9 @@ impl Dyld {
         self.linked_host_functions.push((symbol, f));
 
         // Create guest function to call this host function
-        let function_ptr = mem.alloc(8);
-        let function_ptr: MutPtr<u32> = function_ptr.cast();
-        mem.write(function_ptr + 0, encode_a32_svc(svc));
+        let function_ptr: MutPtr<u32> = Ptr::from_bits(crate::cpu::alloc_code(mem, 8));
         mem.write(function_ptr + 1, encode_a32_ret());
+        crate::cpu::write_svc(mem, function_ptr.to_bits(), svc);
 
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }

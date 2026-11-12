@@ -239,6 +239,10 @@ pub struct Window {
     stick_active: bool,
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
+    /// n72 fork: the iPod's own accelerometer through evdev, when SDL has no
+    /// sensor (it has no Linux sensor backend).
+    #[cfg(feature = "cpu-native")]
+    n72_accelerometer: Option<crate::n72_accel::Accelerometer>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
@@ -255,6 +259,14 @@ impl Window {
     /// Android devices.
     pub fn rotatable_fullscreen() -> bool {
         env::consts::OS == "android"
+    }
+    /// Returns [true] when running on the iPod touch 2G's own 320x480 portrait
+    /// panel (n72 fork, native CPU backend: SDL's KMS/DRM video driver, no
+    /// window manager, the panel cannot turn). The window is always
+    /// fullscreen with an OpenGL ES 1.1 context, and the app's portrait
+    /// framebuffer is shown unrotated (see [Self::rotation_matrix]).
+    pub fn fixed_portrait_panel() -> bool {
+        cfg!(feature = "cpu-native")
     }
     pub fn new(
         title: &str,
@@ -282,6 +294,12 @@ impl Window {
             // Disable blocking of event loop when app is paused.
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }
+        if Self::fixed_portrait_panel() {
+            // OpenGL ES 1.1 is what the MBX (n72-gles) provides.
+            let attr = video_ctx.gl_attr();
+            attr.set_context_version(1, 1);
+            attr.set_context_profile(sdl2::video::GLProfile::GLES);
+        }
 
         // Separate mouse and touch events
         sdl2::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
@@ -296,7 +314,7 @@ impl Window {
         // that here.
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
         let device_orientation = options.initial_orientation;
-        let fullscreen = options.fullscreen;
+        let fullscreen = options.fullscreen || Self::fixed_portrait_panel();
 
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
@@ -331,7 +349,7 @@ impl Window {
             window
         };
 
-        if env::consts::OS == "android" {
+        if env::consts::OS == "android" || Self::fixed_portrait_panel() {
             // Sanity check
             let gl_attr = video_ctx.gl_attr();
             debug_assert_eq!(gl_attr.context_profile(), sdl2::video::GLProfile::GLES);
@@ -393,6 +411,12 @@ impl Window {
             },
             stick_active: false,
             _sensor_ctx: sensor_ctx,
+            #[cfg(feature = "cpu-native")]
+            n72_accelerometer: if accelerometer.is_none() {
+                crate::n72_accel::Accelerometer::open()
+            } else {
+                None
+            },
             accelerometer,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
@@ -909,10 +933,10 @@ impl Window {
 
         if !self.controllers.is_empty() && options.analog_stick_tilt_controls {
             log!("Your connected controller's left analog stick will be used for accelerometer simulation.");
-            if self.accelerometer.is_some() {
+            if self.has_accelerometer() {
                 log!("Disconnect the controller if you want to use your device's accelerometer.");
             }
-        } else if self.accelerometer.is_some() {
+        } else if self.has_accelerometer() {
             log!("Your device's accelerometer will be used for accelerometer simulation.");
             if options.analog_stick_tilt_controls {
                 log!("Connect a controller if you would prefer to use an analog stick.");
@@ -921,7 +945,7 @@ impl Window {
             log!("Connect a controller to get accelerometer simulation.");
         }
 
-        if self.accelerometer.is_none() {
+        if !self.has_accelerometer() {
             log!(
                 "You can {}hold right click and move the cursor to simulate the accelerometer.",
                 if options.analog_stick_tilt_controls {
@@ -935,7 +959,22 @@ impl Window {
 
     /// Get the real or simulated accelerometer output.
     /// See also [crate::frameworks::uikit::ui_accelerometer].
+    /// Whether a real accelerometer is available (SDL's, or the n72 one).
+    fn has_accelerometer(&self) -> bool {
+        #[cfg(feature = "cpu-native")]
+        if self.n72_accelerometer.is_some() {
+            return true;
+        }
+        self.accelerometer.is_some()
+    }
+
     pub fn get_acceleration(&self, options: &Options) -> (f32, f32, f32) {
+        #[cfg(feature = "cpu-native")]
+        if self.controllers.is_empty() || !options.analog_stick_tilt_controls {
+            if let Some(ref accelerometer) = self.n72_accelerometer {
+                return accelerometer.get();
+            }
+        }
         if self.controllers.is_empty() || !options.analog_stick_tilt_controls {
             if let Some(ref accelerometer) = self.accelerometer {
                 let data = accelerometer.get_data().unwrap();
@@ -1360,8 +1399,15 @@ impl Window {
     /// The aspect ratio of this region always reflects the guest app's view of
     /// the world, but the scale and orientation might not.
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
+        // On the device's own panel, the app's portrait framebuffer is shown
+        // as is (see [Self::rotation_matrix]), whatever the orientation.
+        let orientation = if Self::fixed_portrait_panel() {
+            DeviceOrientation::Portrait
+        } else {
+            self.device_orientation
+        };
         let (app_width, app_height) =
-            size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
+            size_for_orientation(self.device_family, orientation, self.scale_hack);
         if !self.fullscreen && !Self::rotatable_fullscreen() {
             return (0, 0, app_width, app_height);
         }
@@ -1400,6 +1446,12 @@ impl Window {
     /// rotating texture co-ordinates to display the image in the window; when
     /// rotating input co-ordinates, invert the matrix.
     pub fn rotation_matrix(&self) -> Matrix<2> {
+        // iPhone OS apps always render a portrait framebuffer (a landscape app
+        // turns its own content), and this panel is the device's own portrait
+        // screen held however the app wants, so nothing is rotated.
+        if Self::fixed_portrait_panel() {
+            return Matrix::identity();
+        }
         match self.device_orientation {
             DeviceOrientation::Portrait => Matrix::identity(),
             DeviceOrientation::PortraitUpsideDown => Matrix::z_rotation(PI),

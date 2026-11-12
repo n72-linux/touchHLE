@@ -659,7 +659,7 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_BYTE),
             framework_state: Default::default(),
         };
 
@@ -791,7 +791,7 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: None,
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_BYTE),
             framework_state: Default::default(),
         };
 

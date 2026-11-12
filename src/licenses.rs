@@ -209,12 +209,14 @@ fn print(out: &mut String, resources_are_external_files: bool) -> Result<(), std
     writeln!(out, "{RUST_DESCRIPTION}")?;
     writeln!(out, "{RUST_DEPENDENCIES}")?;
     divider(out)?;
-    writeln!(out, "{DYNARMIC_DESCRIPTION}")?;
-    writeln!(out, "{DYNARMIC_LICENSE}")?;
-    divider(out)?;
-    writeln!(out, "{DYNARMIC_BOOST_DESCRIPTION}")?;
-    writeln!(out, "{DYNARMIC_BOOST_LICENSE}")?;
-    divider(out)?;
+    if cfg!(feature = "cpu-dynarmic") {
+        writeln!(out, "{DYNARMIC_DESCRIPTION}")?;
+        writeln!(out, "{DYNARMIC_LICENSE}")?;
+        divider(out)?;
+        writeln!(out, "{DYNARMIC_BOOST_DESCRIPTION}")?;
+        writeln!(out, "{DYNARMIC_BOOST_LICENSE}")?;
+        divider(out)?;
+    }
     writeln!(out, "{SDL2_DESCRIPTION}")?;
     writeln!(out, "{SDL2_LICENSE}")?;
     divider(out)?;

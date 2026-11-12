@@ -29,8 +29,10 @@ pub fn prep_stack_for_start(
 
     // We are arbitrarily putting the main thread's stack at the top of the
     // address space (see also: mem::Mem::MAIN_THREAD_STACK_LOW_END).
-    // Since the stack grows downwards, its first byte would be 0xffffffff.
-    let stack_base: usize = 1 << 32;
+    // Since the stack grows downwards, its first byte would be 0xffffffff
+    // (with the native CPU backend: the top of the guest arena).
+    // u64, since the dynarmic value is 2^32.
+    let stack_base: u64 = Mem::MAIN_THREAD_STACK_TOP;
 
     // Rust vectors grow upwards but we need to grow this one downwards, so
     // let's push the strings onto it reversed.
@@ -41,7 +43,7 @@ pub fn prep_stack_for_start(
         string: &str,
         reversed_data: &mut Vec<u8>,
         string_ptrs: &mut Vec<u32>,
-        stack_base: usize,
+        stack_base: u64,
     ) {
         reversed_data.reserve(string.len() + 1);
         reversed_data.push(b'\0'); // null terminator
@@ -49,7 +51,7 @@ pub fn prep_stack_for_start(
             reversed_data.push(c);
         }
 
-        let ptr: u32 = (stack_base - reversed_data.len()).try_into().unwrap();
+        let ptr: u32 = (stack_base - reversed_data.len() as u64).try_into().unwrap();
         string_ptrs.push(ptr);
     }
 
@@ -82,7 +84,7 @@ pub fn prep_stack_for_start(
     }
 
     let stack_ptr: MutPtr<u8> =
-        Ptr::from_bits((stack_base - reversed_data.len()).try_into().unwrap());
+        Ptr::from_bits((stack_base - reversed_data.len() as u64).try_into().unwrap());
     let stack_height: GuestUSize = reversed_data.len().try_into().unwrap();
 
     assert!(stack_height < Mem::MAIN_THREAD_STACK_SIZE);

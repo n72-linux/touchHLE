@@ -61,25 +61,31 @@ pub fn main() {
 
     // Summarise the licensing of Dynarmic
 
-    let dynarmic_readme_path = package_root.join("vendor/dynarmic/README.md");
-    let dynarmic_readme = std::fs::read_to_string(&dynarmic_readme_path).unwrap();
-    rerun_if_changed(&dynarmic_readme_path);
-    let dynarmic_license_path = package_root.join("vendor/dynarmic/LICENSE.txt");
-    let dynarmic_license = std::fs::read_to_string(&dynarmic_license_path).unwrap();
-    rerun_if_changed(&dynarmic_license_path);
+    // n72 fork: the native CPU backend does not link dynarmic, so there is no
+    // dynarmic license text to embed (and vendor/dynarmic may be absent).
+    if std::env::var_os("CARGO_FEATURE_CPU_DYNARMIC").is_none() {
+        std::fs::write(out_dir.join("dynarmic_license.txt"), "").unwrap();
+    } else {
+        let dynarmic_readme_path = package_root.join("vendor/dynarmic/README.md");
+        let dynarmic_readme = std::fs::read_to_string(&dynarmic_readme_path).unwrap();
+        rerun_if_changed(&dynarmic_readme_path);
+        let dynarmic_license_path = package_root.join("vendor/dynarmic/LICENSE.txt");
+        let dynarmic_license = std::fs::read_to_string(&dynarmic_license_path).unwrap();
+        rerun_if_changed(&dynarmic_license_path);
 
-    // Attempt to support Windows where git autocrlf may confuse things.
-    let dynarmic_readme = dynarmic_readme.replace("\r\n", "\n");
-    let (_, dynarmic_legal) = dynarmic_readme.split_once("\nLegal\n-----\n").unwrap();
-    // Strip out the code block start and end lines. They're visual noise when
-    // displayed in ASCII and there's one of these that ends up as its own page
-    // in the license text viewer!
-    let dynarmic_legal = dynarmic_legal.replace("\n```\n", "\n");
-    let dynarmic_license_oneline =
-        "dynarmic is under a 0BSD license. See LICENSE.txt for more details.";
-    assert!(dynarmic_legal.contains(dynarmic_license_oneline));
-    let dynarmic_summary = dynarmic_legal.replace(dynarmic_license_oneline, &dynarmic_license);
-    std::fs::write(out_dir.join("dynarmic_license.txt"), dynarmic_summary).unwrap();
+        // Attempt to support Windows where git autocrlf may confuse things.
+        let dynarmic_readme = dynarmic_readme.replace("\r\n", "\n");
+        let (_, dynarmic_legal) = dynarmic_readme.split_once("\nLegal\n-----\n").unwrap();
+        // Strip out the code block start and end lines. They're visual noise when
+        // displayed in ASCII and there's one of these that ends up as its own page
+        // in the license text viewer!
+        let dynarmic_legal = dynarmic_legal.replace("\n```\n", "\n");
+        let dynarmic_license_oneline =
+            "dynarmic is under a 0BSD license. See LICENSE.txt for more details.";
+        assert!(dynarmic_legal.contains(dynarmic_license_oneline));
+        let dynarmic_summary = dynarmic_legal.replace(dynarmic_license_oneline, &dynarmic_license);
+        std::fs::write(out_dir.join("dynarmic_license.txt"), dynarmic_summary).unwrap();
+    }
 
     // libc++_shared.so has to be copied into the APK. See README of cargo-ndk.
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {

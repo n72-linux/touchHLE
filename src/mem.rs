@@ -35,7 +35,7 @@ pub const fn guest_size_of<T: Sized>() -> GuestUSize {
 }
 
 /// Internal type for representing an untyped virtual address.
-type VAddr = GuestUSize;
+pub type VAddr = GuestUSize;
 
 /// Pointer type for guest memory, or the "guest pointer" type.
 ///
@@ -207,6 +207,7 @@ unsafe impl<T, const MUT: bool> SafeRead for Ptr<T, MUT> {}
 pub trait SafeWrite: Sized {}
 impl<T: SafeRead> SafeWrite for T {}
 
+#[cfg(feature = "cpu-dynarmic")]
 type Bytes = [u8; 1 << 32];
 
 pub const PAGE_SIZE: GuestUSize = 4096;
@@ -235,7 +236,18 @@ pub struct Mem {
     /// Note that unless direct memory access is disabled, the CPU emulation
     /// (dynarmic) accesses memory via this pointer directly except when a page
     /// fault occurs.
+    #[cfg(feature = "cpu-dynarmic")]
     bytes: *mut Bytes,
+
+    /// n72 fork, native CPU backend: guest addresses are host addresses, and
+    /// this is the base of the reserved guest arena
+    /// ([crate::cpu::ARENA_BASE] or the fallback) up to
+    /// [crate::cpu::ARENA_END].
+    #[cfg(feature = "cpu-native")]
+    arena_base: VAddr,
+    /// Gate entries for guest-to-host calls (see [crate::cpu::native]).
+    #[cfg(feature = "cpu-native")]
+    native_gates: crate::cpu::Gates,
 
     /// The size of the __PAGE_ZERO segment, where pointer accesses are trapped
     /// to prevent null pointer derefrences.
@@ -257,8 +269,17 @@ pub struct Mem {
 
 impl Drop for Mem {
     fn drop(&mut self) {
+        #[cfg(feature = "cpu-dynarmic")]
         unsafe {
             crate::mem::host::free_memory(self.bytes.cast(), std::mem::size_of::<Bytes>()).unwrap();
+        }
+        #[cfg(feature = "cpu-native")]
+        unsafe {
+            crate::mem::host::free_memory(
+                self.arena_base as usize as *mut _,
+                (crate::cpu::ARENA_END - self.arena_base) as usize,
+            )
+            .unwrap();
         }
     }
 }
@@ -272,34 +293,70 @@ impl Mem {
     ///
     /// We are arbitrarily putting the stack at the top of the virtual address
     /// space (see also: stack.rs), I have no idea if this matches iPhone OS.
+    #[cfg(feature = "cpu-dynarmic")]
     pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32.wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
+    /// Native CPU backend: the top of the guest arena instead (the host's
+    /// kernel owns the top of the address space).
+    #[cfg(feature = "cpu-native")]
+    pub const MAIN_THREAD_STACK_LOW_END: VAddr =
+        crate::cpu::ARENA_END - Self::MAIN_THREAD_STACK_SIZE;
+    /// One past the highest byte of the main thread's stack (2^32 with
+    /// dynarmic, which is why this is a u64).
+    pub const MAIN_THREAD_STACK_TOP: u64 =
+        Self::MAIN_THREAD_STACK_LOW_END as u64 + Self::MAIN_THREAD_STACK_SIZE as u64;
+    /// The highest byte of the main thread's stack.
+    pub const MAIN_THREAD_STACK_HIGH_BYTE: VAddr = (Self::MAIN_THREAD_STACK_TOP - 1) as VAddr;
 
     /// iPhone OS secondary thread stack size.
     pub const SECONDARY_THREAD_DEFAULT_STACK_SIZE: GuestUSize = 512 * 1024;
 
     /// Create a fresh instance of guest memory.
     pub fn new() -> Mem {
-        let size = std::mem::size_of::<Bytes>();
+        #[cfg(feature = "cpu-dynarmic")]
+        let bytes = {
+            let size = std::mem::size_of::<Bytes>();
 
-        let ptr = unsafe { crate::mem::host::allocate_memory(size).unwrap() };
+            let ptr = unsafe { crate::mem::host::allocate_memory(size).unwrap() };
 
-        assert_eq!(
-            ptr as usize & PAGE_SIZE_ALIGN_MASK as usize,
-            0,
-            "Failed to align host memory with guest memory"
-        );
+            assert_eq!(
+                ptr as usize & PAGE_SIZE_ALIGN_MASK as usize,
+                0,
+                "Failed to align host memory with guest memory"
+            );
 
-        let bytes = ptr as *mut Bytes;
+            ptr as *mut Bytes
+        };
+
+        #[cfg(feature = "cpu-native")]
+        let arena_base = unsafe { crate::mem::host::reserve_guest_arena() };
 
         let vm_allocator = VMAllocator::new(0, Self::MAIN_THREAD_STACK_LOW_END);
 
-        Mem {
+        #[allow(unused_mut)]
+        let mut mem = Mem {
+            #[cfg(feature = "cpu-dynarmic")]
             bytes,
+            #[cfg(feature = "cpu-native")]
+            arena_base,
+            #[cfg(feature = "cpu-native")]
+            native_gates: Default::default(),
             null_segment_size: 0,
             vm_allocator,
             heap_allocator: None,
             zero_memory_on_free: true,
+        };
+        // Native: the pages below the arena cannot be used (page 0, and
+        // 0x1000 on kernels without CONFIG_ARM_LOW_USER_MAPPINGS).
+        #[cfg(feature = "cpu-native")]
+        if arena_base > 0 {
+            mem.vm_allocator.allocate(Some(0), arena_base).unwrap();
         }
+        mem
+    }
+
+    #[cfg(feature = "cpu-native")]
+    pub(crate) fn native_gates_mut(&mut self) -> &mut crate::cpu::Gates {
+        &mut self.native_gates
     }
 
     pub fn create_heap(&mut self, size: GuestUSize) -> HeapAllocator {
@@ -323,12 +380,31 @@ impl Mem {
         //        this, along with removing this special case.
         assert!(self.null_segment_size == 0);
         assert!(new_null_segment_size.is_multiple_of(PAGE_SIZE));
+        #[cfg(feature = "cpu-dynarmic")]
         self.vm_allocator
             .allocate(Some(0), new_null_segment_size)
             .unwrap();
+        // Native: page 0 (and anything below the arena) is already reserved
+        // and unmapped; make the rest of __PAGEZERO fault for real.
+        #[cfg(feature = "cpu-native")]
+        if new_null_segment_size > self.arena_base {
+            self.vm_allocator
+                .allocate(
+                    Some(self.arena_base),
+                    new_null_segment_size - self.arena_base,
+                )
+                .unwrap();
+            unsafe {
+                crate::mem::host::protect_none(
+                    self.arena_base,
+                    new_null_segment_size - self.arena_base,
+                );
+            }
+        }
         self.null_segment_size = new_null_segment_size;
     }
 
+    #[cfg_attr(feature = "cpu-native", allow(dead_code))]
     pub fn null_segment_size(&self) -> VAddr {
         self.null_segment_size
     }
@@ -339,15 +415,47 @@ impl Mem {
     /// Safety: You must ensure that this pointer does not outlive the instance
     /// of [Mem]. You must not use it while a `&mut` is held on some region of
     /// guest memory.
+    #[cfg_attr(feature = "cpu-native", allow(dead_code))]
     pub unsafe fn direct_memory_access_ptr(&mut self) -> *mut std::ffi::c_void {
-        self.bytes.cast()
+        #[cfg(feature = "cpu-dynarmic")]
+        return self.bytes.cast();
+        #[cfg(feature = "cpu-native")]
+        return std::ptr::null_mut();
     }
 
-    fn bytes(&self) -> &Bytes {
-        unsafe { &*self.bytes }
+    /// The guest bytes `addr..addr + count`, or None if they are outside
+    /// guest memory.
+    #[cfg(feature = "cpu-dynarmic")]
+    #[inline]
+    fn slice(&self, addr: VAddr, count: GuestUSize) -> Option<&[u8]> {
+        let bytes: &Bytes = unsafe { &*self.bytes };
+        bytes.get(addr as usize..)?.get(..count as usize)
     }
-    fn bytes_mut(&mut self) -> &mut Bytes {
-        unsafe { &mut *self.bytes }
+    #[cfg(feature = "cpu-dynarmic")]
+    #[inline]
+    fn slice_mut(&mut self, addr: VAddr, count: GuestUSize) -> Option<&mut [u8]> {
+        let bytes: &mut Bytes = unsafe { &mut *self.bytes };
+        bytes.get_mut(addr as usize..)?.get_mut(..count as usize)
+    }
+    #[cfg(feature = "cpu-native")]
+    #[inline]
+    fn slice(&self, addr: VAddr, count: GuestUSize) -> Option<&[u8]> {
+        if addr < self.arena_base || addr as u64 + count as u64 > crate::cpu::ARENA_END as u64 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(addr as usize as *const u8, count as usize) })
+    }
+    #[cfg(feature = "cpu-native")]
+    #[inline]
+    fn slice_mut(&mut self, addr: VAddr, count: GuestUSize) -> Option<&mut [u8]> {
+        if addr < self.arena_base || addr as u64 + count as u64 > crate::cpu::ARENA_END as u64 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts_mut(addr as usize as *mut u8, count as usize) })
+    }
+    #[cold]
+    fn out_of_range(at: VAddr, size: GuestUSize) -> ! {
+        panic!("Guest memory access out of range at {at:#x} ({size:#x} bytes)")
     }
 
     // the performance characteristics of this hasn't been profiled, but it
@@ -363,9 +471,7 @@ impl Mem {
         if addr.to_bits() < self.null_segment_size {
             return None;
         }
-        self.bytes()
-            .get(addr.to_bits() as usize..)?
-            .get(..count as usize)
+        self.slice(addr.to_bits(), count)
     }
     /// Special version of [Self::bytes_at_mut] that returns [None] rather than
     /// panicking on failure. Only for use by [crate::gdb::GdbServer].
@@ -377,9 +483,7 @@ impl Mem {
         if addr.to_bits() < self.null_segment_size {
             return None;
         }
-        self.bytes_mut()
-            .get_mut(addr.to_bits() as usize..)?
-            .get_mut(..count as usize)
+        self.slice_mut(addr.to_bits(), count)
     }
 
     /// Get a slice for reading `count` bytes. This is the basic primitive for
@@ -393,7 +497,8 @@ impl Mem {
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count)
         }
-        &self.bytes()[ptr.to_bits() as usize..][..count as usize]
+        self.slice(ptr.to_bits(), count)
+            .unwrap_or_else(|| Self::out_of_range(ptr.to_bits(), count))
     }
     /// Get a slice for reading `count` bytes without a null-page check.
     ///
@@ -405,7 +510,8 @@ impl Mem {
         ptr: Ptr<u8, MUT>,
         count: GuestUSize,
     ) -> &[u8] {
-        &self.bytes()[ptr.to_bits() as usize..][..count as usize]
+        self.slice(ptr.to_bits(), count)
+            .unwrap_or_else(|| Self::out_of_range(ptr.to_bits(), count))
     }
     /// Get a slice for reading or writing `count` bytes. This is the basic
     /// primitive for safe read-write memory access.
@@ -418,7 +524,9 @@ impl Mem {
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count)
         }
-        &mut self.bytes_mut()[ptr.to_bits() as usize..][..count as usize]
+        let addr = ptr.to_bits();
+        self.slice_mut(addr, count)
+            .unwrap_or_else(|| Self::out_of_range(addr, count))
     }
 
     /// Get a pointer for reading an array of `count` elements of type `T`.
@@ -481,9 +589,19 @@ impl Mem {
     /// Panics if the host pointer is not addressing a location in guest memory.
     pub fn host_ptr_to_guest_ptr(&self, host_ptr: *const std::ffi::c_void) -> ConstVoidPtr {
         let host_ptr = host_ptr.cast::<u8>();
-        let guest_mem_range = self.bytes().as_ptr_range();
-        assert!(guest_mem_range.contains(&host_ptr));
-        let guest_addr = host_ptr as usize - guest_mem_range.start as usize;
+        #[cfg(feature = "cpu-dynarmic")]
+        let guest_addr = {
+            let bytes: &Bytes = unsafe { &*self.bytes };
+            let guest_mem_range = bytes.as_ptr_range();
+            assert!(guest_mem_range.contains(&host_ptr));
+            host_ptr as usize - guest_mem_range.start as usize
+        };
+        #[cfg(feature = "cpu-native")]
+        let guest_addr = {
+            let addr = host_ptr as usize;
+            assert!(addr >= self.arena_base as usize && addr < crate::cpu::ARENA_END as usize);
+            addr
+        };
         Ptr::from_bits(u32::try_from(guest_addr).unwrap())
     }
 
@@ -516,11 +634,20 @@ impl Mem {
 
     /// C-style `memmove`.
     pub fn memmove(&mut self, dest: MutVoidPtr, src: ConstVoidPtr, size: GuestUSize) {
-        let src = src.to_bits() as usize;
-        let dest = dest.to_bits() as usize;
-        let size = size as usize;
-        self.bytes_mut()
-            .copy_within(src..src.checked_add(size).unwrap(), dest)
+        #[cfg(feature = "cpu-dynarmic")]
+        {
+            let src = src.to_bits() as usize;
+            let dest = dest.to_bits() as usize;
+            let size = size as usize;
+            let bytes: &mut Bytes = unsafe { &mut *self.bytes };
+            bytes.copy_within(src..src.checked_add(size).unwrap(), dest)
+        }
+        #[cfg(feature = "cpu-native")]
+        {
+            let src = self.slice(src.to_bits(), size).unwrap().as_ptr();
+            let dest = self.slice_mut(dest.to_bits(), size).unwrap().as_mut_ptr();
+            unsafe { std::ptr::copy(src, dest, size as usize) }
+        }
     }
 
     /// Allocate `size` bytes in the default heap.
