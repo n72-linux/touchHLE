@@ -315,6 +315,7 @@ pub fn draw_font_glyph(
         ));
         let (r, g, b, a) = fill_color;
         let (r, g, b, a) = (r * coverage, g * coverage, b * coverage, a * coverage);
+        crate::frameworks::core_graphics::cg_bitmap_context::n72_cg_stats::op("text");
         drawer.put_pixel((x, y), (r, g, b, a), /* blend: */ true);
     }
 }

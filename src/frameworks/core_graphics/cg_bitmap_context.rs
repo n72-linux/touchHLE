@@ -336,6 +336,7 @@ fn get_pixel_at(
 fn put_pixel(
     data: &CGBitmapContextData,
     pixel_offset: (usize, usize, usize, Option<usize>),
+    pixel_size: GuestUSize,
     pixels: &mut [u8],
     coords: (i32, i32),
     pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
@@ -355,7 +356,6 @@ fn put_pixel(
     // *seems* like the rows are nonetheless in top-to-bottom order?
     let y = data.height - 1 - y;
 
-    let pixel_size = bytes_per_pixel(data);
     let first_component_idx = (y * data.bytes_per_row + x * pixel_size) as usize;
 
     let bg_pixel = get_pixel_at(pixel_offset, pixels, first_component_idx);
@@ -404,8 +404,10 @@ fn put_pixel(
 /// context.
 pub struct CGBitmapContextDrawer<'a> {
     bitmap_info: CGBitmapContextData,
-    /// [pixel_offsets] of `bitmap_info`, computed once (it compares strings).
+    /// [pixel_offsets] and [bytes_per_pixel] of `bitmap_info`, computed once
+    /// (both compare colour-space strings).
     pixel_offset: (usize, usize, usize, Option<usize>),
+    pixel_size: GuestUSize,
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend_mode: CGBlendMode,
     transform: CGAffineTransform,
@@ -429,6 +431,7 @@ impl CGBitmapContextDrawer<'_> {
 
         CGBitmapContextDrawer {
             pixel_offset: pixel_offsets(&bitmap_info),
+            pixel_size: bytes_per_pixel(&bitmap_info),
             bitmap_info,
             rgb_fill_color,
             blend_mode,
@@ -469,9 +472,11 @@ impl CGBitmapContextDrawer<'_> {
         color: (CGFloat, CGFloat, CGFloat, CGFloat),
         blend: bool,
     ) {
+        n72_cg_stats::count(1);
         put_pixel(
             &self.bitmap_info,
             self.pixel_offset,
+            self.pixel_size,
             self.pixels,
             coords,
             color,
@@ -623,6 +628,7 @@ fn test_iter_transformed_pixels() {
 /// Implementation of `CGContextFillRect` (`clear` == [false]) and
 /// `CGContextClearRect` (`clear` == [true]) for `CGBitmapContext`.
 pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRect, clear: bool) {
+    n72_cg_stats::op(if clear { "clear" } else { "fill" });
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let color = if clear {
         (0.0, 0.0, 0.0, 0.0)
@@ -642,6 +648,7 @@ pub(super) fn draw_image(
     rect: CGRect,
     image: CGImageRef,
 ) {
+    n72_cg_stats::op("image");
     let image = cg_image::borrow_image(&env.objc, image);
 
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
@@ -706,3 +713,64 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGBitmapContextGetHeight(_)),
     export_c_func!(CGBitmapContextGetBytesPerRow(_)),
 ];
+
+/// n72 fork, profiling aid: with N72_CG_STATS set, log once a second how many
+/// pixels the software Core Graphics drew per kind of operation.
+pub(crate) mod n72_cg_stats {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    struct Stats {
+        on: bool,
+        current: &'static str,
+        counts: Vec<(&'static str, u64, u64)>, // (op, calls, pixels)
+        since: Instant,
+    }
+
+    thread_local! {
+        static STATS: RefCell<Stats> = RefCell::new(Stats {
+            on: std::env::var_os("N72_CG_STATS").is_some(),
+            current: "other",
+            counts: Vec::new(),
+            since: Instant::now(),
+        });
+    }
+
+    pub fn op(name: &'static str) {
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            if !s.on {
+                return;
+            }
+            s.current = name;
+            match s.counts.iter_mut().find(|c| c.0 == name) {
+                Some(c) => c.1 += 1,
+                None => s.counts.push((name, 1, 0)),
+            }
+        })
+    }
+
+    pub fn count(pixels: u64) {
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            if !s.on {
+                return;
+            }
+            let name = s.current;
+            match s.counts.iter_mut().find(|c| c.0 == name) {
+                Some(c) => c.2 += pixels,
+                None => s.counts.push((name, 0, pixels)),
+            }
+            if s.since.elapsed().as_secs() >= 1 {
+                let line: Vec<String> = s
+                    .counts
+                    .iter()
+                    .map(|(n, calls, px)| format!("{n} {calls} calls {px} px"))
+                    .collect();
+                log!("n72 CG stats/s: {}", line.join(", "));
+                s.counts.clear();
+                s.since = Instant::now();
+            }
+        })
+    }
+}

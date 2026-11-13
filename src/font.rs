@@ -23,6 +23,26 @@ use std::io::Read;
 pub struct Font {
     font: rusttype::Font<'static>,
     scale_factor: f32,
+    /// n72 fork: rasterized glyphs, so text drawn again (every frame, for a
+    /// scrolling ticker) is not re-rasterized from its outline each time.
+    glyph_cache: std::cell::RefCell<GlyphCache>,
+}
+
+/// Key: glyph id, scale (f32 bits), x and y sub-pixel position in quarters.
+type GlyphKey = (u16, u32, u8, u8);
+
+/// A rasterized glyph: bounds relative to the integer pen position, and
+/// coverage (None for glyphs without pixels, e.g. a space).
+type CachedGlyph = Option<((i32, i32), (usize, usize), Vec<f32>)>;
+
+#[derive(Default)]
+struct GlyphCache {
+    map: std::collections::HashMap<GlyphKey, CachedGlyph>,
+}
+
+impl GlyphCache {
+    /// Above this many entries the cache starts again (a few MB at most).
+    const MAX_ENTRIES: usize = 2048;
 }
 
 pub enum TextAlignment {
@@ -92,6 +112,7 @@ impl Font {
         };
 
         Font {
+            glyph_cache: Default::default(),
             font,
             // TODO: Make this a lookup based on the actual font
             // iPhone OS's interpretation of font size is slightly different,
@@ -107,6 +128,7 @@ impl Font {
         };
 
         Font {
+            glyph_cache: Default::default(),
             font,
             scale_factor: 1.0, // No scale factor
         }
@@ -436,15 +458,46 @@ impl Font {
                     y: baseline,
                 },
             ) {
-                let Some(glyph_bounds) = glyph.pixel_bounding_box() else {
+                // n72 fork: snap the pen to quarter pixels and reuse the
+                // rasterized glyph for that (glyph, size, sub-position).
+                let pos = glyph.position();
+                let (ix, iy) = (pos.x.floor(), pos.y.floor());
+                let qx = ((pos.x - ix) * 4.0).round() as u8; // 0..=4
+                let qy = ((pos.y - iy) * 4.0).round() as u8;
+                let key: GlyphKey = (
+                    glyph.id().0,
+                    glyph.scale().x.to_bits(),
+                    qx,
+                    qy,
+                );
+                let mut cache = self.glyph_cache.borrow_mut();
+                if cache.map.len() >= GlyphCache::MAX_ENTRIES {
+                    cache.map.clear();
+                }
+                let cached = cache.map.entry(key).or_insert_with(|| {
+                    let snapped = glyph.unpositioned().clone().positioned(Point {
+                        x: qx as f32 / 4.0,
+                        y: qy as f32 / 4.0,
+                    });
+                    let bounds = snapped.pixel_bounding_box()?;
+                    let dims = (bounds.width() as usize, bounds.height() as usize);
+                    let mut bitmap = vec![0.0f32; dims.0 * dims.1];
+                    snapped.draw(|x, y, coverage| {
+                        bitmap[y as usize * dims.0 + x as usize] = coverage;
+                    });
+                    Some(((bounds.min.x, bounds.min.y), dims, bitmap))
+                });
+                let Some(((bx, by), dims, bitmap)) = cached else {
                     continue;
                 };
+                let dims = *dims;
+                let glyph_origin = (ix as i32 + *bx, iy as i32 + *by);
 
                 // TODO: Refactor this method to support y clipping too.
                 // It's not mandatory since the caller can do it, but it would
                 // be more efficient.
                 if let Some((wrap_width, _)) = wrap {
-                    if glyph_bounds.min.x as f32 > origin.0 + wrap_width {
+                    if glyph_origin.0 as f32 > origin.0 + wrap_width {
                         // Avoid wasting effort on glyphs that are entirely
                         // clipped. Partial clipping is the responsibility of
                         // the draw_glyph implementation.
@@ -452,20 +505,13 @@ impl Font {
                     }
                 }
 
-                let glyph_bitmap_bounds = (
-                    glyph_bounds.width() as usize,
-                    glyph_bounds.height() as usize,
-                );
                 glyph_bitmap.clear();
-                glyph_bitmap.resize(glyph_bitmap_bounds.0 * glyph_bitmap_bounds.1, 0.0);
-
-                glyph.draw(|x, y, coverage| {
-                    glyph_bitmap[y as usize * glyph_bitmap_bounds.0 + x as usize] = coverage;
-                });
+                glyph_bitmap.extend_from_slice(bitmap);
+                drop(cache);
 
                 let raster_glyph = RasterGlyph {
-                    origin: (glyph_bounds.min.x as f32, glyph_bounds.min.y as f32),
-                    dimensions: (glyph_bitmap_bounds.0 as i32, glyph_bitmap_bounds.1 as i32),
+                    origin: (glyph_origin.0 as f32, glyph_origin.1 as f32),
+                    dimensions: (dims.0 as i32, dims.1 as i32),
                     pixels: &glyph_bitmap,
                 };
 
