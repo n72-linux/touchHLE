@@ -67,6 +67,14 @@ impl SEL {
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }
+    /// n72 fork: the selector's address, for the caches keyed by it.
+    pub fn to_bits(self) -> u32 {
+        self.0.to_bits()
+    }
+    /// n72 fork: a selector from [Self::to_bits]'s value.
+    pub fn from_bits(bits: u32) -> SEL {
+        SEL(ConstPtr::from_bits(bits))
+    }
 }
 
 unsafe impl SafeRead for SEL {}

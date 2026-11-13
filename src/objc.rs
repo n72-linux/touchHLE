@@ -88,6 +88,45 @@ pub struct ObjC {
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
     /// channel is needed.
     message_type_info: Option<(std::any::TypeId, &'static str)>,
+
+    /// n72 fork: which methods recent (class, selector) pairs resolved to,
+    /// see [messages::DispatchCache].
+    dispatch_cache: messages::DispatchCache,
+
+    /// n72 fork: which [ObjC] this is, of all the process has made: selectors
+    /// and classes cached per call site ([SiteCache]) belong to one.
+    generation: u32,
+}
+
+/// n72 fork: a selector or class looked up by name once per call site of
+/// [msg] and its relatives, instead of on every send (the names are hashed
+/// with SipHash, hundreds of times a frame). Holds the [ObjC]'s generation
+/// and the address; selectors and classes are never freed.
+pub struct SiteCache {
+    generation: std::sync::atomic::AtomicU32,
+    bits: std::sync::atomic::AtomicU32,
+}
+
+impl SiteCache {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> SiteCache {
+        SiteCache {
+            generation: std::sync::atomic::AtomicU32::new(0),
+            bits: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+    fn get(&self, objc: &ObjC) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.generation.load(Relaxed) == objc.generation).then(|| self.bits.load(Relaxed))
+    }
+    fn set(&self, objc: &ObjC, bits: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // (the host runs every guest thread on one thread; another ObjC's
+        // value in between would only be looked up again)
+        self.generation.store(0, Relaxed);
+        self.bits.store(bits, Relaxed);
+        self.generation.store(objc.generation, Relaxed);
+    }
 }
 
 impl ObjC {
@@ -99,7 +138,34 @@ impl ObjC {
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
             message_type_info: None,
+            dispatch_cache: messages::DispatchCache::new(),
+            generation: {
+                static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         }
+    }
+}
+
+impl ObjC {
+    /// n72 fork: [Self::lookup_selector] with the result kept at the call site.
+    pub fn lookup_selector_cached(&self, site: &SiteCache, name: &str) -> Option<SEL> {
+        if let Some(bits) = site.get(self) {
+            return Some(SEL::from_bits(bits));
+        }
+        let sel = self.lookup_selector(name)?;
+        site.set(self, sel.to_bits());
+        Some(sel)
+    }
+
+    /// n72 fork: [Self::get_known_class] with the result kept at the call site.
+    pub fn get_known_class_cached(&mut self, site: &SiteCache, name: &str, mem: &mut crate::mem::Mem) -> Class {
+        if let Some(bits) = site.get(self) {
+            return crate::mem::Ptr::from_bits(bits);
+        }
+        let class = self.get_known_class(name, mem);
+        site.set(self, class.to_bits());
+        class
     }
 }
 

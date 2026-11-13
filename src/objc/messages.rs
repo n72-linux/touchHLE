@@ -27,6 +27,79 @@ use crate::objc::classes::InitializationStatus;
 use crate::Environment;
 use std::any::TypeId;
 
+/// n72 fork: a direct-mapped cache of method lookups, as every Objective-C
+/// runtime has one: (class the search starts from, selector) to the method
+/// found by walking the superclass chain, which costs two hash map lookups
+/// and a downcast per class on the way, several times a message. Apps send
+/// hundreds of messages a frame (retain, release, the run loop's timers), most
+/// of them the same few.
+///
+/// It is emptied whenever a class is borrowed mutably ([ObjC::borrow_mut]):
+/// methods added or replaced, categories, `+initialize` bookkeeping. Class
+/// objects are never freed, so a key cannot come to mean another class.
+pub(super) struct DispatchCache {
+    entries: Box<[DispatchEntry; DispatchCache::SIZE]>,
+}
+
+#[derive(Clone, Copy)]
+struct DispatchEntry {
+    /// The class's address, with bit 0 set for a search that starts at its
+    /// superclass (`objc_msgSendSuper2`); 0 for an empty entry.
+    class_key: u32,
+    selector: u32,
+    imp: CachedImp,
+    /// The receiver of such a message is an instance, not a class: nothing
+    /// to check for `+initialize`.
+    receiver_is_instance: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CachedImp {
+    Host(&'static dyn super::HostIMP),
+    Guest(super::methods::GuestIMP),
+}
+
+impl DispatchCache {
+    const SIZE: usize = 512;
+
+    pub(super) fn new() -> Self {
+        let empty = DispatchEntry {
+            class_key: 0,
+            selector: 0,
+            imp: CachedImp::Guest(super::methods::GuestIMP::from_addr_with_thumb_bit(0)),
+            receiver_is_instance: false,
+        };
+        DispatchCache {
+            entries: Box::new([empty; Self::SIZE]),
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.class_key = 0;
+        }
+    }
+
+    fn index(class_key: u32, selector: u32) -> usize {
+        // (both are addresses: their low bits say little)
+        (((class_key >> 2) ^ (selector >> 1).wrapping_mul(0x9e37_79b1) ^ (selector >> 9)) as usize) % Self::SIZE
+    }
+
+    fn get(&self, class_key: u32, selector: u32) -> Option<&DispatchEntry> {
+        let entry = &self.entries[Self::index(class_key, selector)];
+        (entry.class_key == class_key && entry.selector == selector).then_some(entry)
+    }
+
+    fn put(&mut self, class_key: u32, selector: u32, imp: CachedImp, receiver_is_instance: bool) {
+        self.entries[Self::index(class_key, selector)] = DispatchEntry {
+            class_key,
+            selector,
+            imp,
+            receiver_is_instance,
+        };
+    }
+}
+
 pub(super) struct ThreadInitializer {
     mutex: MutPtr<pthread_mutex_t>,
     cond: MutPtr<pthread_cond_t>,
@@ -193,8 +266,25 @@ fn objc_msgSend_inner(
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     assert!(orig_class != nil);
-    if !skip_initialize {
+
+    // n72 fork: the method this pair resolved to last time, if any.
+    let class_key = orig_class.to_bits() | super2.is_some() as u32;
+    let selector_bits = selector.to_bits();
+    let mut cached = env.objc.dispatch_cache.get(class_key, selector_bits).copied();
+    if !skip_initialize && !cached.is_some_and(|entry| entry.receiver_is_instance) {
         maybe_initialize_class(env, receiver);
+        // (+initialize may have changed the classes)
+        cached = env.objc.dispatch_cache.get(class_key, selector_bits).copied();
+    }
+    if let Some(entry) = cached {
+        match entry.imp {
+            CachedImp::Host(host_imp) => {
+                check_message_type(env, message_type_info, host_imp, selector, receiver, tolerate_type_mismatch);
+                host_imp.call_from_guest(env)
+            }
+            CachedImp::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
+        }
+        return;
     }
 
     // Traverse the chain of superclasses to find the method implementation.
@@ -245,40 +335,27 @@ fn objc_msgSend_inner(
 
             if let Some(imp) = methods.get(&selector) {
                 log_dbg!("Found method on: {}", name);
-                match imp {
-                    IMP::Host(host_imp) => {
-                        // TODO: do type checks when calling GuestIMPs too.
-                        // That requires using Objective-C type strings,
-                        // rather than Rust types, and should probably
-                        // warn rather than panicking,
-                        // because apps might rely on type punning.
-                        if let Some((sent_type_id, sent_type_desc)) = message_type_info {
-                            let (expected_type_id, expected_type_desc) = host_imp.type_info();
-                            if sent_type_id != expected_type_id {
-                                let msg = format!(
-                                    "\
-Type mismatch when sending message {} to {:?}!
-- Message has type: {:?} / {}
-- Method expects type: {:?} / {}",
-                                    selector.as_str(&env.mem),
-                                    receiver,
-                                    sent_type_id,
-                                    sent_type_desc,
-                                    expected_type_id,
-                                    expected_type_desc
-                                );
-                                if tolerate_type_mismatch {
-                                    log!("Warning: {}", msg);
-                                } else {
-                                    panic!("{}", msg);
-                                }
-                            }
-                        }
+                // (n72 fork: remembered for next time; the borrow of the
+                // class ends here)
+                let found = match imp {
+                    IMP::Host(host_imp) => CachedImp::Host(*host_imp),
+                    IMP::Guest(guest_imp) => CachedImp::Guest(*guest_imp),
+                };
+                let receiver_is_instance = super2.is_none()
+                    && env
+                        .objc
+                        .get_host_object(orig_class)
+                        .and_then(|o| o.as_any().downcast_ref::<super::ClassHostObject>())
+                        .is_some_and(|c| !c.is_metaclass);
+                env.objc.dispatch_cache.put(class_key, selector_bits, found, receiver_is_instance);
+                match found {
+                    CachedImp::Host(host_imp) => {
+                        check_message_type(env, message_type_info, host_imp, selector, receiver, tolerate_type_mismatch);
                         host_imp.call_from_guest(env)
                     }
                     // We can't create a new stack frame, because that would
                     // interfere with pass-through of stack arguments.
-                    IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
+                    CachedImp::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
                 }
                 return;
             } else {
@@ -314,6 +391,46 @@ Type mismatch when sending message {} to {:?}!
             panic!(
                 "Item {class:?} in superclass chain of object {receiver:?}'s class {orig_class:?} has an unexpected host object type."
             );
+        }
+    }
+}
+
+/// Checks a host method's Rust types against those the sender gave, if it
+/// gave any (see [ObjC::message_type_info]).
+fn check_message_type(
+    env: &mut Environment,
+    message_type_info: Option<(TypeId, &'static str)>,
+    host_imp: &'static dyn super::HostIMP,
+    selector: SEL,
+    receiver: id,
+    tolerate_type_mismatch: bool,
+) {
+    // TODO: do type checks when calling GuestIMPs too.
+    // That requires using Objective-C type strings,
+    // rather than Rust types, and should probably
+    // warn rather than panicking,
+    // because apps might rely on type punning.
+    let Some((sent_type_id, sent_type_desc)) = message_type_info else {
+        return;
+    };
+    let (expected_type_id, expected_type_desc) = host_imp.type_info();
+    if sent_type_id != expected_type_id {
+        let msg = format!(
+            "\
+Type mismatch when sending message {} to {:?}!
+- Message has type: {:?} / {}
+- Method expects type: {:?} / {}",
+            selector.as_str(&env.mem),
+            receiver,
+            sent_type_id,
+            sent_type_desc,
+            expected_type_id,
+            expected_type_desc
+        );
+        if tolerate_type_mismatch {
+            log!("Warning: {}", msg);
+        } else {
+            panic!("{}", msg);
         }
     }
 }
@@ -551,7 +668,8 @@ macro_rules! msg {
     [$env:expr; $receiver:tt $name:ident $(: $arg1:tt $($($namen:ident)?: $argn:tt)*)?] => {
         {
             let sel = $crate::objc::selector!($($arg1;)? $name $($(, $($namen)?)*)?);
-            let sel = $env.objc.lookup_selector(sel)
+            static SELECTOR_SITE: $crate::objc::SiteCache = $crate::objc::SiteCache::new();
+            let sel = $env.objc.lookup_selector_cached(&SELECTOR_SITE, sel)
                 .expect("Unknown selector");
             let args = ($receiver, sel, $($arg1, $($argn),*)?);
             $crate::objc::msg_send($env, args)
@@ -588,12 +706,15 @@ pub use crate::msg; // #[macro_export] is weird...
 macro_rules! msg_super {
     [$env:expr; $receiver:tt $name:ident $(: $arg1:tt $($($namen:ident)?: $argn:tt)*)?] => {
         {
-            let class = $env.objc.get_known_class(
+            static CLASS_SITE: $crate::objc::SiteCache = $crate::objc::SiteCache::new();
+            let class = $env.objc.get_known_class_cached(
+                &CLASS_SITE,
                 _OBJC_CURRENT_CLASS,
                 &mut $env.mem
             );
             let sel = $crate::objc::selector!($($arg1;)? $name $($(, $($namen)?)*)?);
-            let sel = $env.objc.lookup_selector(sel)
+            static SELECTOR_SITE: $crate::objc::SiteCache = $crate::objc::SiteCache::new();
+            let sel = $env.objc.lookup_selector_cached(&SELECTOR_SITE, sel)
                 .expect("Unknown selector");
 
             let sp = &mut $env.cpu.regs_mut()[$crate::cpu::Cpu::SP];
@@ -632,7 +753,9 @@ pub use crate::msg_super; // #[macro_export] is weird...
 macro_rules! msg_class {
     [$env:expr; $receiver_class:ident $name:ident $(: $arg1:tt $($($namen:ident)?: $argn:tt)*)?] => {
         {
-            let class = $env.objc.get_known_class(
+            static CLASS_SITE: $crate::objc::SiteCache = $crate::objc::SiteCache::new();
+            let class = $env.objc.get_known_class_cached(
+                &CLASS_SITE,
                 stringify!($receiver_class),
                 &mut $env.mem
             );

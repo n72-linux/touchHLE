@@ -1725,6 +1725,9 @@ impl Environment {
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
             let mut next_awakening: Option<Instant> = None;
+            // n72 fork: the time is read once a pass, and only if a thread
+            // sleeps (a system call each time: ARMv6 Linux has no vDSO).
+            let mut now: Option<Instant> = None;
             for i in 0..self.threads.len() {
                 let thread_id = (self.current_thread + 1 + i) % self.threads.len();
                 let candidate = &mut self.threads[thread_id];
@@ -1734,7 +1737,7 @@ impl Environment {
                 }
                 match candidate.blocked_by {
                     ThreadBlock::Sleeping(sleeping_until) => {
-                        if sleeping_until <= Instant::now() {
+                        if sleeping_until <= *now.get_or_insert_with(Instant::now) {
                             log_dbg!("Thread {} finished sleeping.", thread_id);
                             candidate.blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
