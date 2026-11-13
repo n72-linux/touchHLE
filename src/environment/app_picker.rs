@@ -1423,3 +1423,125 @@ fn setup_quick_options(
         orientation_buttons: button_rows[1][..].try_into().unwrap(),
     }
 }
+
+/// n72 fork: home-screen tiles for n72-ui, one per app in the apps
+/// directory (`touchHLE --n72-tiles=OUT_DIR[:ICON_DIR]`).
+///
+/// For every `.app`/`.ipa` (an `.app` wins over an `.ipa` of the same app)
+/// it writes `OUT_DIR/ios-<id>.app` (`name=` the display name, `exec=
+/// n72-touchhle <path>`, `image=` the icon, `icon=game` for launchers that
+/// cannot show images) and the icon as `ICON_DIR/ios-<id>.n72i`: "N72I",
+/// u16 width, u16 height (little endian), then B, G, R, A per pixel
+/// (straight alpha), the icon as the iPhone OS home screen draws it
+/// (rounded, with its sheen). Tiles of apps no longer there are removed.
+/// Only files are rewritten that changed, so a caller can tell from the
+/// exit status (0 nothing changed, 10 tiles changed) whether to reload.
+pub fn n72_export_tiles(out_dir: &Path, icon_dir: &Path) -> Result<bool, String> {
+    let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
+    let apps_dir = std::fs::canonicalize(&apps_dir).map_err(|e| format!("{}: {e}", apps_dir.display()))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(icon_dir).map_err(|e| e.to_string())?;
+
+    // one tile per app: the extracted .app over the .ipa (an .ipa is read
+    // whole into RAM, so it is not even opened when the .app is there)
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&apps_dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        let ext = path.extension();
+        if ext != Some(OsStr::new("app")) && ext != Some(OsStr::new("ipa")) {
+            continue;
+        }
+        let stem = path.file_stem().unwrap_or_default().to_owned();
+        match paths.iter().position(|p| p.file_stem().unwrap_or_default() == stem) {
+            Some(i) if ext == Some(OsStr::new("app")) => paths[i] = path,
+            Some(_) => (),
+            None => paths.push(path),
+        }
+    }
+    let mut chosen = Vec::new();
+    for path in paths {
+        let (bundle, fs) = match BundleData::open_any(&path)
+            .and_then(|data| Bundle::new_bundle_and_fs_from_host_path(data, /* read_only_mode: */ true))
+        {
+            Ok(ok) => ok,
+            Err(e) => {
+                log!("Warning: couldn't open app bundle {}: {} (no tile)", path.display(), e);
+                continue;
+            }
+        };
+        let icon = bundle.load_icon(&fs).ok();
+        chosen.push(AppInfo {
+            path,
+            display_name: bundle.display_name().to_owned(),
+            icon,
+            display_name_ns_string: None,
+            icon_ui_image: None,
+        });
+    }
+    chosen.sort_by_key(|app| app.display_name.to_uppercase());
+
+    let mut changed = false;
+    let mut write_if_changed = |path: &Path, bytes: &[u8]| -> Result<(), String> {
+        if std::fs::read(path).ok().as_deref() != Some(bytes) {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
+            changed = true;
+        }
+        Ok(())
+    };
+    let mut wanted = Vec::new();
+    for app in &chosen {
+        let id: String = app
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+            .collect();
+        let tile = format!("ios-{id}");
+        let mut manifest = format!(
+            "name={}\nicon=game\nexec=n72-touchhle '{}'\n",
+            app.display_name.replace('\n', " "),
+            app.path.display().to_string().replace('\'', "'\\''")
+        );
+        if let Some(icon) = &app.icon {
+            let (w, h) = icon.dimensions();
+            let mut bytes = Vec::with_capacity(8 + (w * h * 4) as usize);
+            bytes.extend_from_slice(b"N72I");
+            bytes.extend_from_slice(&(w as u16).to_le_bytes());
+            bytes.extend_from_slice(&(h as u16).to_le_bytes());
+            for p in icon.pixels().chunks_exact(4) {
+                let a = p[3] as u32;
+                let un = |c: u8| -> u8 {
+                    if a == 0 { 0 } else { ((c as u32 * 255 + a / 2) / a).min(255) as u8 }
+                };
+                bytes.extend_from_slice(&[un(p[2]), un(p[1]), un(p[0]), p[3]]);
+            }
+            let icon_path = icon_dir.join(format!("{tile}.n72i"));
+            write_if_changed(&icon_path, &bytes)?;
+            manifest.push_str(&format!("image={}\n", icon_path.display()));
+        }
+        write_if_changed(&out_dir.join(format!("{tile}.app")), manifest.as_bytes())?;
+        echo!("n72 tile {}: {} ({})", tile, app.display_name, app.path.display());
+        wanted.push(tile);
+    }
+    // tiles of apps that are gone
+    for (dir, ext) in [(out_dir, "app"), (icon_dir, "n72i")] {
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem.starts_with("ios-")
+                && path.extension() == Some(OsStr::new(ext))
+                && !wanted.iter().any(|w| w == stem)
+            {
+                let _ = std::fs::remove_file(&path);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}

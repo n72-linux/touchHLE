@@ -126,6 +126,21 @@ pub fn main<T: Iterator<Item = String>>(#[allow(unused_mut)] mut args: T) -> Res
         if args_vec.iter().any(|a| a == "--n72-native-selftest") {
             std::process::exit(cpu::native_selftest::run_selftest());
         }
+        // `touchHLE --n72-tiles=OUT_DIR[:ICON_DIR]`: n72-ui home-screen tiles
+        // for the apps directory (exit 10 if any changed, 0 if not).
+        if let Some(arg) = args_vec.iter().find_map(|a| a.strip_prefix("--n72-tiles=")) {
+            let (out, icons) = arg.split_once(':').unwrap_or((arg, "/usr/share/n72-ui/icons"));
+            match environment::app_picker::n72_export_tiles(
+                std::path::Path::new(out),
+                std::path::Path::new(icons),
+            ) {
+                Ok(changed) => std::process::exit(if changed { 10 } else { 0 }),
+                Err(e) => {
+                    echo!("n72 tiles: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         args_vec.into_iter()
     };
     echo!(
