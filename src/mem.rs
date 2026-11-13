@@ -440,6 +440,16 @@ impl Mem {
     #[cfg(feature = "cpu-native")]
     #[inline]
     fn slice(&self, addr: VAddr, count: GuestUSize) -> Option<&[u8]> {
+        // Zero bytes are always fine (memcpy(dst, NULL, 0)), as with dynarmic,
+        // but the slice must still point at `addr`: callers derive pointers
+        // from it (ptr_at with count 0). Only address 0 gets a dangling one.
+        if count == 0 {
+            return Some(if addr == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(addr as usize as *const u8, 0) }
+            });
+        }
         if addr < self.arena_base || addr as u64 + count as u64 > crate::cpu::ARENA_END as u64 {
             return None;
         }
@@ -448,6 +458,13 @@ impl Mem {
     #[cfg(feature = "cpu-native")]
     #[inline]
     fn slice_mut(&mut self, addr: VAddr, count: GuestUSize) -> Option<&mut [u8]> {
+        if count == 0 {
+            return Some(if addr == 0 {
+                &mut []
+            } else {
+                unsafe { std::slice::from_raw_parts_mut(addr as usize as *mut u8, 0) }
+            });
+        }
         if addr < self.arena_base || addr as u64 + count as u64 > crate::cpu::ARENA_END as u64 {
             return None;
         }

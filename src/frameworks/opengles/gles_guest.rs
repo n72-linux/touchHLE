@@ -709,8 +709,19 @@ fn glVertexPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
+        let guest = pointer;
         let pointer =
             translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        // n72 fork, debugging blank frames: show the first calls.
+        static N72_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N72_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            let mut binding = 0;
+            gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut binding);
+            log!(
+                "n72: glVertexPointer(size {}, type {:#x}, stride {}, guest {:?}) -> host {:?}, array buffer {}",
+                size, type_, stride, guest, pointer, binding
+            );
+        }
         gles.VertexPointer(size, type_, stride, pointer)
     })
 }

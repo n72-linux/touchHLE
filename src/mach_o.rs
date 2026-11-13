@@ -265,9 +265,15 @@ impl MachO {
                     if arch.cputype != mach_object::CPU_TYPE_ARM {
                         continue;
                     }
-                    if arch.cpusubtype == mach_object::CPU_SUBTYPE_ARM_V7
-                        || (arch.cpusubtype == mach_object::CPU_SUBTYPE_ARM_V6
-                            && best_type != Some(mach_object::CPU_SUBTYPE_ARM_V7))
+                    // n72 fork: the native backend runs on an ARMv6 CPU
+                    // (ARM1176), which cannot run armv7 code.
+                    let (preferred, other) = if cfg!(feature = "cpu-native") {
+                        (mach_object::CPU_SUBTYPE_ARM_V6, mach_object::CPU_SUBTYPE_ARM_V7)
+                    } else {
+                        (mach_object::CPU_SUBTYPE_ARM_V7, mach_object::CPU_SUBTYPE_ARM_V6)
+                    };
+                    if arch.cpusubtype == preferred
+                        || (arch.cpusubtype == other && best_type != Some(preferred))
                         || best_type.is_none()
                     {
                         best_subslice = Some(
@@ -287,6 +293,16 @@ impl MachO {
             }
         };
 
+        #[cfg(feature = "cpu-native")]
+        if header.cpusubtype != mach_object::CPU_SUBTYPE_ARM_V6
+            && header.cpusubtype != mach_object::CPU_SUBTYPE_ARM_ALL
+        {
+            log!(
+                "Warning: {:?} has no armv6 code ({}); the iPod's ARMv6 CPU cannot run it.",
+                name,
+                cpu_subtype_to_str(header.cpusubtype)
+            );
+        }
         if header.cputype != mach_object::CPU_TYPE_ARM {
             return Err("Executable is not for an ARM CPU!");
         }

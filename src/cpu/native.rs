@@ -575,7 +575,38 @@ mod signals {
             EXIT_SLICE
         } else {
             if !in_guest {
-                // A host crash: let it happen as it would without us.
+                // A host crash: report where (async-signal-safe), then let it
+                // happen as it would without us.
+                let mut buf = [0u8; 160];
+                let mut n = 0;
+                let mut put = |s: &[u8]| {
+                    for &b in s {
+                        if n < buf.len() {
+                            buf[n] = b;
+                            n += 1;
+                        }
+                    }
+                };
+                let hex = |v: u32| {
+                    let mut h = [0u8; 10];
+                    h[0] = b'0';
+                    h[1] = b'x';
+                    for i in 0..8 {
+                        let d = ((v >> (28 - 4 * i)) & 0xf) as u8;
+                        h[2 + i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+                    }
+                    h
+                };
+                put(b"n72 native: host crash, signal ");
+                put(&[b'0' + (sig / 10) as u8, b'0' + (sig % 10) as u8]);
+                put(b" pc ");
+                put(&hex(mc.arm_pc as u32));
+                put(b" lr ");
+                put(&hex(mc.arm_lr as u32));
+                put(b" addr ");
+                put(&hex(mc.fault_address as u32));
+                put(b"\n");
+                libc::write(2, buf.as_ptr() as *const _, n);
                 libc::signal(sig, libc::SIG_DFL);
                 return;
             }

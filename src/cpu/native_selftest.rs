@@ -185,6 +185,54 @@ pub fn run_selftest() -> i32 {
         "endless loop is preempted by the time slice",
     );
 
+    // Preemption keeps guest state: a long countdown loop is interrupted by
+    // the time slice several times; d9 (VFP), r4 and the flags must survive.
+    let pre = base + 0x800;
+    put(
+        &mut mem,
+        pre,
+        &[
+            0xe92d_4010, // push {r4, lr}
+            0xe3a0_1101, // mov r1, #0x40000000
+            0xe3a0_2000, // mov r2, #0
+            0xec41_2b19, // vmov d9, r2, r1         (2.0)
+            0xe3a0_4c7d, // mov r4, #0x7d00
+            0xe3a0_3640, // mov r3, #0x4000000      (64 M iterations)
+            0xe253_3001, // loop: subs r3, r3, #1
+            0x1aff_fffd, // bne loop
+            0xec41_2b17, // vmov d7, r2, r1
+            0xeeb4_9b47, // vcmp.f64 d9, d7
+            0xeef1_fa10, // vmrs APSR_nzcv, fpscr
+            0x03a0_0001, // moveq r0, #1
+            0x13a0_0002, // movne r0, #2
+            0xe354_0c7d, // cmp r4, #0x7d00
+            0x13a0_0003, // movne r0, #3
+            0xe8bd_8010, // pop {r4, pc}
+        ],
+    );
+    flush(pre, 64);
+    let regs = cpu.regs_mut();
+    regs[13] = stack_top;
+    regs[14] = done;
+    cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(pre));
+    let mut slices = 0;
+    let state = loop {
+        let mut ticks = 100_000u64;
+        match cpu.run_or_step(&mut mem, Some(&mut ticks)) {
+            CpuState::Normal if ticks == 0 => slices += 1,
+            other => break other,
+        }
+    };
+    t.check(
+        matches!(state, CpuState::Svc(SVC_DONE)) && cpu.regs()[0] == 1 && slices > 0,
+        &format!(
+            "preempted {} times; VFP, r4 and flags kept: r0 = {} (1 = ok, 2 = d9 lost, 3 = r4 lost), {:?}",
+            slices,
+            cpu.regs()[0],
+            state
+        ),
+    );
+
     // Host-call round trip cost.
     put(&mut mem, arm_fn, &[0xeb00_0000 | ((site.wrapping_sub(arm_fn + 8) >> 2) & 0x00ff_ffff), 0xeaff_fffd]); // bl site; b arm_fn
     flush(arm_fn, 8);

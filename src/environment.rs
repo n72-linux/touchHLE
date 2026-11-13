@@ -529,7 +529,10 @@ impl Environment {
                     // While properly behaving apps should be fine, some app
                     // will try to poke the top of the stack, so we'll give
                     // it some room.
-                    env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
+                    // (n72 fork: relative to the stack top, which is not the
+                    // top of the address space with the native backend.)
+                    env.cpu.regs_mut()[Cpu::SP] =
+                        (mem::Mem::MAIN_THREAD_STACK_TOP - 0x1000) as u32;
 
                     // Call `+load` method on classes where it's defined.
                     // TODO: `+load` methods from our image should take priority
