@@ -77,17 +77,22 @@ pub fn run_selftest() -> i32 {
     write_svc(&mut mem, site, SVC_CALL);
 
     // ARM guest: r0 = 5; call site; r0 += 1; d8 = 2.0 survives the call;
-    // returns r0 + (d8 == 2.0 ? 100 : 0).
+    // returns r0 + (d8 == 2.0 ? 100 : 0). (VFPv2 has no vmov immediate, so
+    // 2.0 = 0x40000000_00000000 goes in through core registers.)
     put(
         &mut mem,
         arm_fn,
         &[
-            0xe92d_4000,                                              // push {lr}
-            0xe3a0_0005,                                              // mov r0, #5
-            0xeeb0_8b00,                                              // vmov.f64 d8, #2.0
-            0xeb00_0000 | ((site.wrapping_sub(arm_fn + 12 + 8) >> 2) & 0x00ff_ffff), // bl site
-            0xe280_0001,                                              // add r0, r0, #1
-            0xeeb0_7b00,                                              // vmov.f64 d7, #2.0
+            0xe92d_4000, // push {lr}
+            0xe3a0_1101, // mov r1, #0x40000000
+            0xe3a0_2000, // mov r2, #0
+            0xec41_2b18, // vmov d8, r2, r1
+            0xe3a0_0005, // mov r0, #5
+            0xeb00_0000 | ((site.wrapping_sub(arm_fn + 20 + 8) >> 2) & 0x00ff_ffff), // bl site
+            0xe280_0001, // add r0, r0, #1
+            0xe3a0_1101, // mov r1, #0x40000000
+            0xe3a0_2000, // mov r2, #0
+            0xec41_2b17, // vmov d7, r2, r1
             0xeeb4_8b47,                                              // vcmp.f64 d8, d7
             0xeef1_fa10,                                              // vmrs APSR_nzcv, fpscr
             0x0280_0064,                                              // addeq r0, r0, #100
@@ -102,7 +107,12 @@ pub fn run_selftest() -> i32 {
     let (state, calls) = run(&mut cpu, &mut mem, 10);
     t.check(
         matches!(state, CpuState::Svc(SVC_DONE)) && calls == 1,
-        "ARM guest calls the host once and returns to the host routine",
+        &format!(
+            "ARM guest calls the host once and returns to the host routine ({:?}, {} calls, pc {:#x})",
+            state,
+            calls,
+            cpu.regs()[15]
+        ),
     );
     t.check(
         cpu.regs()[0] == 151,
@@ -156,7 +166,10 @@ pub fn run_selftest() -> i32 {
         cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(fault_fn));
         let mut ticks = 100_000u64;
         let state = cpu.run_or_step(&mut mem, Some(&mut ticks));
-        t.check(matches!(&state, CpuState::Error(e) if *e == expect), name);
+        t.check(
+            matches!(&state, CpuState::Error(e) if *e == expect),
+            &format!("{name} ({state:?}, pc {:#x})", cpu.regs()[15]),
+        );
     }
 
     // Preemption: an endless loop must come back with the slice used up.

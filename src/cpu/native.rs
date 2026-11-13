@@ -512,14 +512,21 @@ mod signals {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            for sig in [
+            // The handler must not be interrupted by another of these: a
+            // nested one would see N72_IN_GUEST still set and take the
+            // handler's own registers for the guest's.
+            let sigs = [
                 libc::SIGSEGV,
                 libc::SIGBUS,
                 libc::SIGILL,
                 libc::SIGTRAP,
                 timer_signal(),
-            ] {
+            ];
+            libc::sigemptyset(&mut sa.sa_mask);
+            for sig in sigs {
+                libc::sigaddset(&mut sa.sa_mask, sig);
+            }
+            for sig in sigs {
                 assert!(libc::sigaction(sig, &sa, std::ptr::null_mut()) == 0);
             }
 
@@ -572,7 +579,16 @@ mod signals {
                 libc::signal(sig, libc::SIG_DFL);
                 return;
             }
+            // ARM Linux reports a user BKPT (a prefetch abort) as SIGBUS, so
+            // look at the instruction.
+            let thumb = mc.arm_cpsr as u32 & Cpu::CPSR_THUMB != 0;
+            let is_bkpt = if thumb {
+                (*(pc as *const u16) & 0xff00) == 0xbe00
+            } else {
+                (*(pc as *const u32) & 0x0ff0_00f0) == 0x0120_0070
+            };
             match sig {
+                _ if is_bkpt && sig != libc::SIGSEGV => EXIT_BREAKPOINT,
                 libc::SIGILL => EXIT_UNDEFINED,
                 libc::SIGTRAP => EXIT_BREAKPOINT,
                 _ => EXIT_MEMORY,
