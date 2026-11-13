@@ -26,6 +26,27 @@ arm-unknown-linux-musleabihf --no-default-features --features cpu-native`
 (needs `alpine-work/sysroot-armhf`). On the device: Alpine `sdl2`,
 `openal-soft-libs`, `libstdc++`, `libgcc` (installed), plus the new n72-gles.
 
+## Spore performance work (2026-11-13)
+
+Spore 1.0.78 (decrypted IPA, run from an extracted `Spore.app`; n72-ui tile
+`/usr/share/n72-ui/apps/spore.app` -> `/usr/bin/n72-touchhle-spore`) went from
+~3.3 to ~5.8 FPS. Measuring: `--print-fps`, `N72_PROF=file` + `kill -USR2`
+(built-in sampler; the kernel has no perf events), `N72_GLES_STATS=1` (per
+GPU frame: TA, render, ioctl), `N72_CG_STATS=1`, `N72_LAYER_DUMP=1`.
+
+Done: armv6 slices, stack top, zero-length access fix, .app instead of .ipa
+(touchHLE caches every file read from an .ipa), GPU frame copy into a shared
+texture (EGL share groups + 2D-engine glCopyTexImage2D), composite straight to
+the window, fast present path ignoring hidden sublayers, one present texture,
+glyph cache, gamma tables, fast clears, PtrMap hashing, twiddled textures by
+default in n72-gles (the MBX fetches linear textures ~2x slower; iOS
+twiddles), NEAREST for 1:1 copies.
+
+Per frame now (~170 ms): GPU ~40 ms (Spore's scene 24 ms, composite 15 ms,
+synchronous), CPU ~130 ms (scene build ~50 ms: guest + GL dispatch + n72-gles
+software T&L; the rest touchHLE overhead). Next: re-profile the CPU side,
+asynchronous TA frames (kernel), mipmaps on (N72_GLES_MIPMAP, image unchecked).
+
 ## 0. Ground rules for the fork
 
 - **Private fork, never upstreamed.** touchHLE's CONTRIBUTING.md forbids
