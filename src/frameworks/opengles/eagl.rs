@@ -589,15 +589,17 @@ unsafe fn copy_renderbuffer_to_texture(
         t
     });
     gles.BindTexture(gles11::TEXTURE_2D, texture);
+    // Composited 1:1 on the device panel: NEAREST is the same image and half
+    // the MBX's cost for a linear-layout texture (see present_renderbuffer).
     gles.TexParameteri(
         gles11::TEXTURE_2D,
         gles11::TEXTURE_MIN_FILTER,
-        gles11::LINEAR as _,
+        gles11::NEAREST as _,
     );
     gles.TexParameteri(
         gles11::TEXTURE_2D,
         gles11::TEXTURE_MAG_FILTER,
-        gles11::LINEAR as _,
+        gles11::NEAREST as _,
     );
     gles.TexParameteri(
         gles11::TEXTURE_2D,
@@ -695,11 +697,15 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     );
     // The texture will not have any mip levels so we must ensure the filter
     // does not use them, else rendering will fail.
-    gles.TexParameteri(
-        gles11::TEXTURE_2D,
-        gles11::TEXTURE_MIN_FILTER,
-        gles11::LINEAR as _,
-    );
+    // n72 fork: on the device panel it is drawn 1:1, where NEAREST gives the
+    // same image and the MBX fetches a linear-layout texture twice as fast.
+    let n72_filter = if crate::window::Window::fixed_portrait_panel() {
+        gles11::NEAREST
+    } else {
+        gles11::LINEAR
+    };
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, n72_filter as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, n72_filter as _);
 
     // Clean up the framebuffer object since we no longer need it.
     // This also sets the framebuffer bindings back to zero, so rendering
