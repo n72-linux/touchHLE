@@ -194,8 +194,22 @@ fn prng(state: u32) -> u32 {
 
 const RAND_MAX: i32 = i32::MAX;
 
+/// n72 fork: N72_FIXED_SEED=1 makes every seed the app sets the same one, so
+/// that test runs of a game are more alike (its scenes are otherwise random
+/// from run to run, and so is the work per frame).
+fn n72_seed(seed: u32) -> u32 {
+    #[cfg(feature = "n72-prof")]
+    {
+        static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FIXED.get_or_init(|| std::env::var_os("N72_FIXED_SEED").is_some_and(|v| v != "0")) {
+            return 0x6e37_3200;
+        }
+    }
+    seed
+}
+
 fn srand(env: &mut Environment, seed: u32) {
-    env.libc_state.stdlib.rand = seed;
+    env.libc_state.stdlib.rand = n72_seed(seed);
 }
 
 // BSD's rand() seed function — we just use host system time,
@@ -206,7 +220,7 @@ fn sranddev(env: &mut Environment) {
         .unwrap()
         .as_nanos();
     let seed = (time ^ (time >> 32)) as u32;
-    env.libc_state.stdlib.rand = seed;
+    env.libc_state.stdlib.rand = n72_seed(seed);
 }
 
 fn rand(env: &mut Environment) -> i32 {
@@ -226,7 +240,7 @@ fn srandom(env: &mut Environment, seed: u32) {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    env.libc_state.stdlib.random = seed;
+    env.libc_state.stdlib.random = n72_seed(seed);
 }
 fn random(env: &mut Environment) -> i32 {
     // TODO: handle errno properly

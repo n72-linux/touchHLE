@@ -462,54 +462,79 @@ pub fn write_svc(mem: &mut Mem, site: VAddr, svc: u32) {
 /// the running guest thread (see `crate::n72_direct`). Read by the direct
 /// trampolines; anything else makes them take the gate.
 pub static mut N72_GL_DIRECT_READY: u32 = 0;
-/// Scratch for a direct trampoline's r4/lr: host functions reached directly
-/// never call back into the guest and are not preempted (N72_IN_GUEST is 0
-/// meanwhile), so one slot is enough.
-static mut N72_DIRECT_SAVE: [u32; 2] = [0; 2];
+/// The shared parts of the direct trampolines: (ready flag's address, routine).
+static N72_DIRECT_COMMON: std::sync::Mutex<Vec<(u32, VAddr)>> = std::sync::Mutex::new(Vec::new());
 
 /// n72 direct calls: make the stub at `site` (already linked to a gate with
 /// [write_svc]) call `host_fn` straight from guest code when `ready` (an
 /// address holding a u32) is non-zero, else take the gate as before.
 /// `host_fn` must use the guest's calling convention (AAPCS, soft-float),
-/// take no stack arguments from a moved stack, and never re-enter the guest.
+/// take its arguments in registers only (two words go on the guest's stack
+/// first), and never re-enter the guest.
+///
+/// A stub of four words per function leads to a routine all of them share
+/// (per ready flag): the calls come by the thousand per frame, between
+/// stretches of guest code that push everything else out of the 16 KiB
+/// instruction cache, so what each function's own path adds must be small.
+/// (A trampoline of its own was 80 bytes, three cache lines, with literals
+/// that cost data cache lines as well.) Host functions reached this way are
+/// not preempted: N72_IN_GUEST is 0 meanwhile.
 pub fn write_direct(mem: &mut Mem, site: VAddr, host_fn: u32, ready: u32) -> bool {
     let mut gates = std::mem::take(mem.native_gates_mut());
     let Some(&gate) = gates.sites.get(&site) else {
         *mem.native_gates_mut() = gates;
         return false;
     };
-    let tramp = gates.alloc_near(mem, 20 * 4, Some(site));
+    let in_range = |a: VAddr, b: VAddr| (a as i64 - b as i64).abs() < BRANCH_RANGE - 0x1000;
+    let mut commons = N72_DIRECT_COMMON.lock().unwrap();
+    let common = match commons.iter().find(|&&(r, c)| r == ready && in_range(c, site)) {
+        Some(&(_, c)) => c,
+        None => {
+            let c = gates.alloc_near(mem, 17 * 4, Some(site));
+            let off = |i: u32, lit: u32| -> u32 { 4 * lit - (4 * i + 8) };
+            let in_guest = std::ptr::addr_of!(N72_IN_GUEST) as u32;
+            // On entry ip = the stub's third word (its branch to the gate);
+            // the host function's address follows it.
+            let words: [u32; 17] = [
+                0xe92d_4010,              // push {r4, lr}
+                0xe59f_4000 | off(1, 15), // ldr r4, =ready
+                0xe594_e000,              // ldr lr, [r4]
+                0xe35e_0000,              // cmp lr, #0
+                0x0a00_0007,              // beq 13f
+                0xe59f_4000 | off(5, 16), // ldr r4, =N72_IN_GUEST
+                0xe3a0_e000,              // mov lr, #0
+                0xe584_e000,              // str lr, [r4]
+                0xe59c_c004,              // ldr ip, [ip, #4]
+                0xe12f_ff3c,              // blx ip
+                0xe3a0_c001,              // mov ip, #1
+                0xe584_c000,              // str ip, [r4]
+                0xe8bd_8010,              // pop {r4, pc}
+                0xe8bd_4010,              // 13: pop {r4, lr}
+                0xe12f_ff1c,              // bx ip (the stub's branch to the gate)
+                ready,
+                in_guest,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                mem.write(Ptr::from_bits(c + 4 * i as u32), *w);
+            }
+            flush_icache(c, 17 * 4);
+            commons.push((ready, c));
+            c
+        }
+    };
+    let stub = gates.alloc_near(mem, 4 * 4, Some(site));
     *mem.native_gates_mut() = gates;
-    let off = |i: u32, lit: u32| -> u32 { 4 * lit - (4 * i + 8) };
-    let in_guest = std::ptr::addr_of!(N72_IN_GUEST) as u32;
-    let save = std::ptr::addr_of!(N72_DIRECT_SAVE) as u32;
-    let words: [u32; 20] = [
-        0xe59f_c000 | off(0, 15), // ldr ip, =ready
-        0xe59c_c000,              // ldr ip, [ip]
-        0xe35c_0000,              // cmp ip, #0
-        0x059f_f000 | off(3, 16), // ldreq pc, =gate entry
-        0xe59f_c000 | off(4, 17), // ldr ip, =save
-        0xe88c_4010,              // stmia ip, {r4, lr}
-        0xe59f_4000 | off(6, 18), // ldr r4, =N72_IN_GUEST
-        0xe3a0_c000,              // mov ip, #0
-        0xe584_c000,              // str ip, [r4]
-        0xe59f_c000 | off(9, 19), // ldr ip, =host_fn
-        0xe12f_ff3c,              // blx ip
-        0xe3a0_c001,              // mov ip, #1
-        0xe584_c000,              // str ip, [r4]
-        0xe59f_c000 | off(13, 17), // ldr ip, =save
-        0xe89c_8010,              // ldmia ip, {r4, pc}
-        ready,
-        gate,
-        save,
-        in_guest,
+    let words: [u32; 4] = [
+        0xe1a0_c00f,                   // mov ip, pc
+        encode_a32_b(stub + 4, common), // b common
+        encode_a32_b(stub + 8, gate),   // b gate
         host_fn,
     ];
     for (i, w) in words.iter().enumerate() {
-        mem.write(Ptr::from_bits(tramp + 4 * i as u32), *w);
+        mem.write(Ptr::from_bits(stub + 4 * i as u32), *w);
     }
-    flush_icache(tramp, 20 * 4);
-    mem.write(Ptr::from_bits(site), encode_a32_b(site, tramp));
+    flush_icache(stub, 4 * 4);
+    mem.write(Ptr::from_bits(site), encode_a32_b(site, stub));
     flush_icache(site, 4);
     true
 }

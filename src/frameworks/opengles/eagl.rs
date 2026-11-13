@@ -477,10 +477,57 @@ fn n72_thread_report(frames: u32) {
                 }
             }
         }
+        line += &n72_counters_report(frames);
         echo!("{line}");
+    } else {
+        n72_counters_report(frames);
     }
     *wall = Some(Instant::now());
     *last = now;
+}
+
+/// n72 fork: the calling (main) thread's hardware counters per frame, where
+/// the kernel has perf events (a test kernel; an empty string otherwise):
+/// cycles, instructions and instruction cache misses, the ARM1176's events
+/// 0xff, 0x07 and 0x00. The scenes of a game differ from run to run, so
+/// frame rates do not compare; cycles per instruction and misses per
+/// instruction do.
+fn n72_counters_report(frames: u32) -> String {
+    use std::sync::Mutex;
+    const PERF_TYPE_HARDWARE: u32 = 0;
+    const PERF_TYPE_RAW: u32 = 4;
+    static FDS: Mutex<Option<[i32; 3]>> = Mutex::new(None);
+    static LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+    let mut fds = FDS.lock().unwrap();
+    let fds = *fds.get_or_insert_with(|| {
+        // (type, config): CPU cycles; raw 0x07, instructions; raw 0x00, I-cache misses
+        [(PERF_TYPE_HARDWARE, 0u64), (PERF_TYPE_RAW, 0x07), (PERF_TYPE_RAW, 0x00)].map(|(ty, config)| {
+            // struct perf_event_attr, PERF_ATTR_SIZE_VER0: type, size, config, then zeroes
+            let mut attr = [0u32; 16];
+            attr[0] = ty;
+            attr[1] = 64;
+            attr[2] = config as u32;
+            unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) as i32 }
+        })
+    });
+    if fds.iter().any(|&fd| fd < 0) {
+        return String::new();
+    }
+    let mut now = [0u64; 3];
+    for (value, &fd) in now.iter_mut().zip(&fds) {
+        unsafe { libc::read(fd, value as *mut u64 as *mut _, 8) };
+    }
+    let mut last = LAST.lock().unwrap();
+    let d: [f64; 3] = std::array::from_fn(|i| (now[i] - last[i]) as f64);
+    *last = now;
+    format!(
+        " main thread per frame: {:.2} M cycles, {:.2} M instructions ({:.2} cycles each), {:.1} k I-cache misses ({:.1} per 1000 instructions)",
+        d[0] / 1e6 / frames as f64,
+        d[1] / 1e6 / frames as f64,
+        d[0] / d[1].max(1.0),
+        d[2] / 1e3 / frames as f64,
+        d[2] * 1000.0 / d[1].max(1.0),
+    )
 }
 
 fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options) -> Option<Duration> {

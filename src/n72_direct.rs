@@ -123,6 +123,7 @@ macro_rules! shims {
         fn shim_for(name: &str) -> Option<usize> {
             match name {
                 $(stringify!($name) => Some($name as usize),)*
+                "glOrthof" => Some(glOrthof as usize),
                 _ => None,
             }
         }
@@ -134,8 +135,18 @@ shims! {
     glTranslatef(x: f32, y: f32, z: f32);
     glScalef(x: f32, y: f32, z: f32);
     glColor4f(r: f32, g: f32, b: f32, a: f32);
-    glOrthof(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32);
     glMaterialf(face: u32, pname: u32, param: f32);
+}
+
+/// glOrthof has six words of arguments: the last two are on the guest's
+/// stack, above the two words the direct stub's routine pushed
+/// ([crate::cpu::write_direct]).
+#[allow(non_snake_case, clippy::too_many_arguments)]
+extern "aapcs" fn glOrthof(l: f32, r: f32, b: f32, t: f32, _pushed_r4: u32, _pushed_lr: u32, n: f32, f: f32) {
+    static F: OnceLock<usize> = OnceLock::new();
+    let host = *F.get_or_init(|| gl("glOrthof"));
+    let host: extern "C" fn(f32, f32, f32, f32, f32, f32) = unsafe { std::mem::transmute(host) };
+    host(l, r, b, t, n, f)
 }
 
 extern "aapcs" fn n72_sinf(x: f32) -> f32 {
