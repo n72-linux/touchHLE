@@ -284,6 +284,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let n = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n % 200 == 0 {
             env.dyld.n72_svc_report(200);
+            n72_thread_report(200);
         }
     }
 
@@ -443,6 +444,45 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// an interval's worth of accumulated slop. Allowing infinite accumulation of
 /// slop is not desirable, because if the game is running slowly for a long time
 /// and suddenly speeds back up, it will then run too fast for a long time.
+/// n72 fork: exact CPU time of every host thread per frame (N72_SVC_STATS=1),
+/// from the scheduler's per-thread clocks. `/proc`'s utime and stime are
+/// samples taken at the timer tick, and the per-thread clocks of another
+/// process cannot be read at all.
+fn n72_thread_report(frames: u32) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+    static WALL: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+        return;
+    };
+    let mut now = Vec::new();
+    for tid in dir.flatten().filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok()) {
+        // CPUCLOCK_SCHED of a thread: (~tid << 3) | 6
+        let id = (((!(tid as u32)) << 3) | 6) as libc::clockid_t;
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(id, &mut ts) } == 0 {
+            now.push((tid, ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64));
+        }
+    }
+    let mut last = LAST.lock().unwrap();
+    let mut wall = WALL.lock().unwrap();
+    if let Some(t0) = *wall {
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        let mut line = format!("n72 threads: {ms:.1} ms/frame;");
+        for &(tid, t) in &now {
+            if let Some(&(_, t_old)) = last.iter().find(|&&(l, _)| l == tid) {
+                let per = (t - t_old) as f64 / 1e6 / frames as f64;
+                if per >= 0.05 {
+                    line += &format!(" {tid} {per:.1} ms;");
+                }
+            }
+        }
+        echo!("{line}");
+    }
+    *wall = Some(Instant::now());
+    *last = now;
+}
+
 fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options) -> Option<Duration> {
     let interval = {
         let fps = options.fps_limit?;

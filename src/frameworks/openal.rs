@@ -134,7 +134,8 @@ fn alcOpenDevice(env: &mut Environment, devicename: ConstPtr<u8>) -> MutPtr<Gues
         env.mem.free(d_name.cast_mut().cast());
     }
 
-    let res = unsafe { al::alcOpenDevice(std::ptr::null()) };
+    // n72 fork: the shared host device, see [crate::audio::openal::shared_device].
+    let res = crate::audio::openal::shared_device().unwrap_or_else(|| unsafe { al::alcOpenDevice(std::ptr::null()) });
     if res.is_null() {
         log_dbg!("alcOpenDevice(NULL) returned NULL");
         return Ptr::null();
@@ -168,6 +169,10 @@ fn alcCloseDevice(env: &mut Environment, device: MutPtr<GuestALCdevice>) -> bool
         return false;
     };
     env.mem.free(device.cast());
+    if crate::audio::openal::shared_device() == Some(host_device) {
+        // n72 fork: the shared host device stays open.
+        return true;
+    }
     let res = unsafe { al::alcCloseDevice(host_device) };
     log_dbg!("alcCloseDevice({:?}) => {:?}", device, res,);
     res != al::ALC_FALSE
@@ -255,6 +260,14 @@ fn alcCreateContext(
         return Ptr::null();
     };
 
+    // n72 fork: on the shared host device the attributes (the mixer's rate,
+    // source counts: hints) are left out, or a context made later would
+    // reset the device under the ones already playing.
+    let attr_list_ptr = if crate::audio::openal::shared_device() == Some(host_device) {
+        std::ptr::null()
+    } else {
+        attr_list_ptr
+    };
     let res = unsafe {
         OpenALContext::new_with_device_and_attrlist(
             env.openal_manager.as_mut(),

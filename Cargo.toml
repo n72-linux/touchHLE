@@ -33,6 +33,11 @@ static = ["sdl2/bundled", "sdl2/static-link", "touchHLE_openal_soft_wrapper/stat
 # (n72 fork) runs guest code directly on a 32-bit ARMv6 Linux host.
 cpu-dynarmic = ["dep:touchHLE_dynarmic_wrapper"]
 cpu-native = []
+# n72 fork: OpenAL Soft from vendor/ built for the target and linked in,
+# without the rest of "static" (SDL2 stays the system's).
+openal-static = ["touchHLE_openal_soft_wrapper/static"]
+# n72 fork: opt-in sampling profiler, SVC/CG/thread stats, layer/touch dumps
+n72-prof = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -1,6 +1,8 @@
 # Source this to cross-build the n72 native backend for the iPod touch 2G:
 #   . n72/env.sh && cargo build --release --target arm-unknown-linux-musleabihf \
-#       --no-default-features --features cpu-native
+#       --no-default-features --features cpu-native,openal-static
+# (openal-static: OpenAL Soft from the vendor/openal-soft submodule, built for
+# the ARM1176 and linked in; n72/alsoft.conf goes next to the binary.)
 # Needs rustup's stable toolchain with the arm-unknown-linux-musleabihf target,
 # Homebrew LLVM (clang, llvm-ar) and the exported Alpine armhf sysroot.
 N72_HLE=$(cd "$(dirname "${BASH_SOURCE:-${(%):-%x}}")/.." && pwd)

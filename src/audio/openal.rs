@@ -43,9 +43,36 @@ pub struct OpenALContext {
     device: *mut ALCdevice,
 }
 
+/// n72 fork: the one host device that every context is made on, touchHLE's
+/// own (audio queues, system sounds) and those of the app's OpenAL devices
+/// alike, or `None` with N72_AL_SHARED=0.
+///
+/// Each OpenAL Soft device has a mixer thread of its own that renders and
+/// converts its output and feeds its own ALSA stream whether or not anything
+/// plays; on the iPod touch 2G one such thread takes over a tenth of the CPU
+/// (float mixing without NEON, then ALSA's format conversion and dmix). A
+/// device's contexts share its mixer, so one device does the fixed part of
+/// that work once. It is never closed.
+pub fn shared_device() -> Option<*mut ALCdevice> {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    static DEVICE: AtomicPtr<ALCdevice> = AtomicPtr::new(std::ptr::null_mut());
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        cfg!(feature = "cpu-native") && !std::env::var_os("N72_AL_SHARED").is_some_and(|v| v == "0")
+    }) {
+        return None;
+    }
+    let mut device = DEVICE.load(Ordering::Relaxed);
+    if device.is_null() {
+        device = unsafe { al_sys::alcOpenDevice(std::ptr::null()) };
+        DEVICE.store(device, Ordering::Relaxed);
+    }
+    Some(device)
+}
+
 impl OpenALContext {
     pub fn new(_manager: &mut OpenALManager) -> Result<Self, String> {
-        let device = unsafe { al_sys::alcOpenDevice(std::ptr::null()) };
+        let device = shared_device().unwrap_or_else(|| unsafe { al_sys::alcOpenDevice(std::ptr::null()) });
         if device.is_null() {
             return Err("Could not open OpenAL device".to_string());
         }

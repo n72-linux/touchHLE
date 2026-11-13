@@ -48,6 +48,47 @@ fn main() {
         build.define("ALSOFT_NO_CONFIG_UTIL", "ON");
         build.define("ALSOFT_EXAMPLES", "OFF");
 
+        // n72 fork (iPod touch 2G, Alpine): cross-built against the sysroot,
+        // with ALSA as the only backend (loaded at run time, so nothing to
+        // link). Alpine's own libopenal is built -Os with libstdc++'s
+        // assertions on, which leaves a bounds-checked call per sample in
+        // the mixer's and the resamplers' inner loops; this build takes the
+        // profile's optimisation level.
+        let n72 = os.eq_ignore_ascii_case("linux")
+            && env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "arm");
+        if n72 {
+            if let Ok(sysroot) = env::var("N72_SYSROOT") {
+                build.define("CMAKE_SYSROOT", &sysroot);
+                build.define("CMAKE_FIND_ROOT_PATH", &sysroot);
+                build.define("CMAKE_FIND_ROOT_PATH_MODE_PROGRAM", "NEVER");
+                build.define("CMAKE_FIND_ROOT_PATH_MODE_LIBRARY", "ONLY");
+                build.define("CMAKE_FIND_ROOT_PATH_MODE_INCLUDE", "ONLY");
+                build.define("CMAKE_FIND_ROOT_PATH_MODE_PACKAGE", "ONLY");
+            }
+            // (the host's ar, which CMake would pick, cannot index ELF objects)
+            if let Ok(ar) = env::var("AR_arm_unknown_linux_musleabihf") {
+                build.define("CMAKE_RANLIB", format!("{}-ranlib", ar.trim_end_matches("-ar")));
+                build.define("CMAKE_AR", ar);
+            }
+            // (the vendored release asks for a CMake older than current ones accept)
+            build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+            build.define("ALSOFT_REQUIRE_ALSA", "ON");
+            build.define("ALSOFT_DLOPEN", "ON");
+            for backend in ["OSS", "PIPEWIRE", "SOLARIS", "SNDIO", "PORTAUDIO", "PULSEAUDIO", "JACK", "SDL2", "WAVE"] {
+                build.define(&format!("ALSOFT_BACKEND_{backend}"), "OFF");
+            }
+            build.define("CMAKE_DISABLE_FIND_PACKAGE_SDL2", "ON");
+            // (it relies on headers that newer libstdc++ no longer pulls in)
+            build.cxxflag("-include cstdint");
+            build.define("ALSOFT_RTKIT", "OFF");
+            build.define("ALSOFT_CPUEXT_NEON", "OFF");
+            build.define("ALSOFT_EMBED_HRTF_DATA", "OFF");
+            build.define("ALSOFT_INSTALL_CONFIG", "OFF");
+            build.define("ALSOFT_INSTALL_HRTF_DATA", "OFF");
+            build.define("ALSOFT_INSTALL_AMBDEC_PRESETS", "OFF");
+            build.define("ALSOFT_UPDATE_BUILD_VERSION", "OFF");
+        }
+
         let openal_soft_out = build.build();
 
         link_search(&openal_soft_out.join("lib"));
@@ -55,9 +96,13 @@ fn main() {
         link_search(&openal_soft_out.join("lib64"));
 
         // Some dependencies of OpenAL Soft.
-        if os.eq_ignore_ascii_case("linux") {
+        if os.eq_ignore_ascii_case("linux") && !n72 {
             // OpenAL on Linux depends on sndio, needs to be dynamically linked
             println!("cargo:rustc-link-lib=dylib=sndio");
+        }
+        if n72 {
+            // (C++; libstdc++ comes from Alpine like the rest)
+            println!("cargo:rustc-link-lib=dylib=stdc++");
         }
         if os.eq_ignore_ascii_case("android") {
             println!("cargo:rustc-link-lib=dylib=OpenSLES");
