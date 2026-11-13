@@ -302,6 +302,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     };
 
+    // n72 fork: without kEAGLDrawablePropertyRetainedBacking (the default)
+    // the renderbuffer's contents are undefined after presenting, as on iOS:
+    // n72-gles is told so (glDiscardFramebufferEXT) once the frame is copied,
+    // and the next frame skips reloading the old pixels on the GPU.
+    let n72_discard = crate::window::Window::fixed_portrait_panel() && {
+        n72_resolve_discard(env.window.as_ref().unwrap());
+        !n72_retained_backing(env, drawable)
+    };
+    N72_DISCARD_NEXT.store(n72_discard, std::sync::atomic::Ordering::Relaxed);
+
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
     if drawable == fullscreen_layer {
@@ -310,11 +320,34 @@ pub const CLASSES: ClassExports = objc_classes! {
             drawable,
             renderbuffer,
         );
+        // n72 fork: once the renderbuffer is window-backed (n72-gles draws
+        // it straight into the panel's back buffer), presenting is a swap.
+        if crate::window::Window::fixed_portrait_panel() && n72_is_window_backed(renderbuffer) {
+            drop(super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread));
+            env.window.as_ref().unwrap().swap_window();
+            if let Some(sleep_for) = sleep_for {
+                env.sleep(sleep_for);
+            }
+            return true;
+        }
         // re-borrow
         unsafe {
             present_renderbuffer(env);
         }
+        if crate::window::Window::fixed_portrait_panel() {
+            let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+            unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, true) };
+        }
     } else {
+        if crate::window::Window::fixed_portrait_panel() && n72_is_window_backed(renderbuffer) {
+            // Not the only layer any more: back to the renderbuffer's own
+            // storage (this frame is in the panel buffer: copy it out first
+            // below, or drop it when this layer is hidden anyway).
+            if fullscreen_layer != nil {
+                let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false) };
+            }
+        }
         if fullscreen_layer != nil {
             // If there's a single layer that covers the screen, and this isn't
             // it, there's no point in presenting the output because it won't be
@@ -350,7 +383,11 @@ pub const CLASSES: ClassExports = objc_classes! {
             let opaque = crate::frameworks::core_animation::ca_eagl_layer::layer_is_opaque(env, drawable);
             let (texture, width, height) = {
                 let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-                unsafe { copy_renderbuffer_to_texture(gles.as_mut(), existing, opaque) }
+                let r = unsafe { copy_renderbuffer_to_texture(gles.as_mut(), existing, opaque) };
+                if n72_is_window_backed(renderbuffer) {
+                    unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false) };
+                }
+                r
             };
             crate::frameworks::core_animation::ca_eagl_layer::present_texture(env, drawable, texture, width, height);
             if let Some(sleep_for) = sleep_for {
@@ -558,6 +595,77 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     (pixel_buffer, width_u32, height_u32)
 }
 
+/// n72 fork: renderbuffers n72-gles draws straight into the panel's back
+/// buffer (`glRenderbufferWindowBackedN72`). Names are per context; the
+/// device panel only runs apps with one rendering context in practice, and a
+/// name from another context just takes the normal path.
+static N72_WINDOW_BACKED: std::sync::Mutex<Vec<GLuint>> = std::sync::Mutex::new(Vec::new());
+static N72_WINDOW_BACKED_FN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn n72_is_window_backed(renderbuffer: GLuint) -> bool {
+    N72_WINDOW_BACKED.lock().unwrap().contains(&renderbuffer)
+}
+
+unsafe fn n72_set_window_backed(gles: &mut dyn GLES, renderbuffer: GLuint, on: bool) {
+    if std::env::var_os("N72_WINDOW_BACKED").is_some_and(|v| v == "0") {
+        return;
+    }
+    let f = N72_WINDOW_BACKED_FN.load(std::sync::atomic::Ordering::Relaxed);
+    if f <= 1 {
+        return;
+    }
+    let set: extern "C" fn(GLuint, u8) = std::mem::transmute(f);
+    // Keep the app's error state: report only our own call's result.
+    let pending = gles.GetError();
+    set(renderbuffer, on as u8);
+    let ok = gles.GetError() == gles11::NO_ERROR;
+    let mut list = N72_WINDOW_BACKED.lock().unwrap();
+    list.retain(|&r| r != renderbuffer);
+    if on && ok {
+        list.push(renderbuffer);
+        log!("n72: renderbuffer {} is window-backed (presents are swaps)", renderbuffer);
+    }
+    let _ = pending;
+}
+
+/// n72 fork: whether the current present may discard the renderbuffer.
+static N72_DISCARD_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// n72 fork: `glDiscardFramebufferEXT` from the host GL (0: not offered).
+static N72_DISCARD_FN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn n72_resolve_discard(window: &crate::window::Window) {
+    if N72_DISCARD_FN.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        let f = window.gl_get_proc_address("glDiscardFramebufferEXT");
+        N72_DISCARD_FN.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+        let f = window.gl_get_proc_address("glRenderbufferWindowBackedN72");
+        N72_WINDOW_BACKED_FN.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn n72_retained_backing(env: &mut Environment, drawable: id) -> bool {
+    let props: id = msg![env; drawable drawableProperties];
+    if props == nil {
+        return false;
+    }
+    let key = get_static_str(env, kEAGLDrawablePropertyRetainedBacking);
+    let value: id = msg![env; props objectForKey:key];
+    value != nil && msg![env; value boolValue]
+}
+
+/// n72 fork: the colour attachment of the bound framebuffer (the app's
+/// renderbuffer, just copied out) is no longer needed.
+unsafe fn n72_discard_bound_color() {
+    if !N72_DISCARD_NEXT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let f = N72_DISCARD_FN.load(std::sync::atomic::Ordering::Relaxed);
+    if f > 1 {
+        let discard: extern "C" fn(GLenum, i32, *const GLenum) = std::mem::transmute(f);
+        let attachments = [gles11::COLOR_ATTACHMENT0_OES];
+        discard(gles11::FRAMEBUFFER_OES, 1, attachments.as_ptr());
+    }
+}
+
 /// n72 fork: copy the renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES` into
 /// `texture` (or a new texture) with glCopyTexImage2D, restoring the app's
 /// bindings. Returns the texture and the frame size.
@@ -614,6 +722,7 @@ unsafe fn copy_renderbuffer_to_texture(
     // RGB for an opaque layer: its alpha is meant to be ignored.
     let format = if opaque { gles11::RGB } else { gles11::RGBA };
     gles.CopyTexImage2D(gles11::TEXTURE_2D, 0, format, 0, 0, width, height, 0);
+    n72_discard_bound_color();
 
     gles.BindTexture(gles11::TEXTURE_2D, old_texture);
     gles.ActiveTexture(old_active_texture);
@@ -695,6 +804,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         height,
         0,
     );
+    n72_discard_bound_color();
     // The texture will not have any mip levels so we must ensure the filter
     // does not use them, else rendering will fail.
     // n72 fork: on the device panel it is drawn 1:1, where NEAREST gives the
