@@ -38,9 +38,11 @@ fn eviocgabs(abs: u32) -> u32 {
     (2 << 30) | ((std::mem::size_of::<InputAbsinfo>() as u32) << 16) | (0x45 << 8) | (0x40 + abs)
 }
 
-/// The default mapping assumes the chip's axes follow the screen and that,
-/// like SDL, it reports the reaction to gravity (flat on its back: z = +1 g).
-const DEFAULT_MAP: [(usize, f32); 3] = [(0, -1.0), (1, -1.0), (2, -1.0)];
+/// The kernel already reports the LIS3LV02DL in the UIAcceleration
+/// convention: lying flat screen up reads (0, 0, -1000) mg and raising the
+/// top gives y < 0 (measured on the device; an earlier guess negated all
+/// three axes and reversed every tilt).
+const DEFAULT_MAP: [(usize, f32); 3] = [(0, 1.0), (1, 1.0), (2, 1.0)];
 
 fn parse_map(s: &str) -> Option<[(usize, f32); 3]> {
     let mut out = [(0, 1.0); 3];
