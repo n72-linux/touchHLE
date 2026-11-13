@@ -1481,14 +1481,19 @@ pub fn n72_export_tiles(out_dir: &Path, icon_dir: &Path) -> Result<bool, String>
     chosen.sort_by_key(|app| app.display_name.to_uppercase());
 
     let mut changed = false;
-    let mut write_if_changed = |path: &Path, bytes: &[u8]| -> Result<(), String> {
-        if std::fs::read(path).ok().as_deref() != Some(bytes) {
+    // Atomic replace (rename into place): the launcher watches the manifest
+    // directory and reads a tile's icon when its .app appears, so an icon is
+    // always written before its manifest, and a changed icon rewrites the
+    // manifest too.
+    let mut write_if_changed = |path: &Path, bytes: &[u8], force: bool| -> Result<bool, String> {
+        if force || std::fs::read(path).ok().as_deref() != Some(bytes) {
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
             std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
             changed = true;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     };
     let mut wanted = Vec::new();
     for app in &chosen {
@@ -1506,6 +1511,7 @@ pub fn n72_export_tiles(out_dir: &Path, icon_dir: &Path) -> Result<bool, String>
             app.display_name.replace('\n', " "),
             app.path.display().to_string().replace('\'', "'\\''")
         );
+        let mut icon_changed = false;
         if let Some(icon) = &app.icon {
             let (w, h) = icon.dimensions();
             let mut bytes = Vec::with_capacity(8 + (w * h * 4) as usize);
@@ -1520,10 +1526,10 @@ pub fn n72_export_tiles(out_dir: &Path, icon_dir: &Path) -> Result<bool, String>
                 bytes.extend_from_slice(&[un(p[2]), un(p[1]), un(p[0]), p[3]]);
             }
             let icon_path = icon_dir.join(format!("{tile}.n72i"));
-            write_if_changed(&icon_path, &bytes)?;
+            icon_changed = write_if_changed(&icon_path, &bytes, false)?;
             manifest.push_str(&format!("image={}\n", icon_path.display()));
         }
-        write_if_changed(&out_dir.join(format!("{tile}.app")), manifest.as_bytes())?;
+        write_if_changed(&out_dir.join(format!("{tile}.app")), manifest.as_bytes(), icon_changed)?;
         echo!("n72 tile {}: {} ({})", tile, app.display_name, app.path.display());
         wanted.push(tile);
     }
