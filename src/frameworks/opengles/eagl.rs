@@ -342,6 +342,22 @@ pub const CLASSES: ClassExports = objc_classes! {
             renderbuffer,
             drawable,
         );
+        // n72 fork: on the device all GL contexts share objects with the
+        // compositor's (gles.rs), so the frame is copied on the GPU into a
+        // shared texture (n72-gles: MBX 2D copy) and never touches RAM.
+        if crate::window::Window::fixed_portrait_panel() {
+            let existing = crate::frameworks::core_animation::ca_eagl_layer::presented_texture_for(env, drawable);
+            let opaque = crate::frameworks::core_animation::ca_eagl_layer::layer_is_opaque(env, drawable);
+            let (texture, width, height) = {
+                let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                unsafe { copy_renderbuffer_to_texture(gles.as_mut(), existing, opaque) }
+            };
+            crate::frameworks::core_animation::ca_eagl_layer::present_texture(env, drawable, texture, width, height);
+            if let Some(sleep_for) = sleep_for {
+                env.sleep(sleep_for);
+            }
+            return true;
+        }
         let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
         // re-borrow
         let (pixels_vec, width, height) = {
@@ -540,6 +556,52 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
 
     (pixel_buffer, width_u32, height_u32)
+}
+
+/// n72 fork: copy the renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES` into
+/// `texture` (or a new texture) with glCopyTexImage2D, restoring the app's
+/// bindings. Returns the texture and the frame size.
+unsafe fn copy_renderbuffer_to_texture(
+    gles: &mut dyn GLES,
+    texture: Option<GLuint>,
+    opaque: bool,
+) -> (GLuint, u32, u32) {
+    let renderbuffer: GLuint = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as _;
+    let (width, height) = get_renderbuffer_size(gles);
+    let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
+    let old_active_texture: GLenum = get_int(gles, gles11::ACTIVE_TEXTURE) as _;
+    gles.ActiveTexture(gles11::TEXTURE0);
+    let old_texture: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
+
+    let mut src_framebuffer = 0;
+    gles.GenFramebuffersOES(1, &mut src_framebuffer);
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
+    gles.FramebufferRenderbufferOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::RENDERBUFFER_OES,
+        renderbuffer,
+    );
+
+    let texture = texture.unwrap_or_else(|| {
+        let mut t = 0;
+        gles.GenTextures(1, &mut t);
+        t
+    });
+    gles.BindTexture(gles11::TEXTURE_2D, texture);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
+    gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+    // RGB for an opaque layer: its alpha is meant to be ignored.
+    let format = if opaque { gles11::RGB } else { gles11::RGBA };
+    gles.CopyTexImage2D(gles11::TEXTURE_2D, 0, format, 0, 0, width, height, 0);
+
+    gles.BindTexture(gles11::TEXTURE_2D, old_texture);
+    gles.ActiveTexture(old_active_texture);
+    gles.DeleteFramebuffersOES(1, &src_framebuffer);
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+    (texture, width as u32, height as u32)
 }
 
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`

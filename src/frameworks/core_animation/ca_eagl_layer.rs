@@ -136,3 +136,33 @@ pub fn present_pixels(env: &mut Environment, layer: id, pixels: Vec<u8>, width: 
     host_obj.presented_pixels = Some((pixels, width, height));
     host_obj.gles_texture_is_up_to_date = false;
 }
+
+/// n72 fork: the texture (shared with the compositor) that last held this
+/// layer's frame, to be reused for the next one.
+pub fn presented_texture_for(env: &mut Environment, layer: id) -> Option<crate::gles::gles11_raw::types::GLuint> {
+    env.objc
+        .borrow::<CALayerHostObject>(layer)
+        .presented_texture
+        .map(|(texture, _, _)| texture)
+}
+
+/// n72 fork: whether the layer is opaque (its alpha channel is ignored).
+pub fn layer_is_opaque(env: &mut Environment, layer: id) -> bool {
+    env.objc.borrow::<CALayerHostObject>(layer).opaque
+}
+
+/// n72 fork: like [present_pixels], but the frame is already in `texture`, a
+/// texture object shared with the compositor's GL context (RGBA, rows bottom
+/// to top as glReadPixels would give them).
+pub fn present_texture(
+    env: &mut Environment,
+    layer: id,
+    texture: crate::gles::gles11_raw::types::GLuint,
+    width: u32,
+    height: u32,
+) {
+    let host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    host_obj.presented_texture = Some((texture, width, height));
+    host_obj.presented_pixels = None;
+    host_obj.gles_texture_is_up_to_date = false;
+}

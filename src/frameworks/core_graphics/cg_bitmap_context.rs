@@ -335,6 +335,7 @@ fn get_pixel_at(
 
 fn put_pixel(
     data: &CGBitmapContextData,
+    pixel_offset: (usize, usize, usize, Option<usize>),
     pixels: &mut [u8],
     coords: (i32, i32),
     pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
@@ -357,7 +358,6 @@ fn put_pixel(
     let pixel_size = bytes_per_pixel(data);
     let first_component_idx = (y * data.bytes_per_row + x * pixel_size) as usize;
 
-    let pixel_offset = pixel_offsets(data);
     let bg_pixel = get_pixel_at(pixel_offset, pixels, first_component_idx);
 
     // Blending like this must be done in linear RGB, so this must come before
@@ -404,6 +404,8 @@ fn put_pixel(
 /// context.
 pub struct CGBitmapContextDrawer<'a> {
     bitmap_info: CGBitmapContextData,
+    /// [pixel_offsets] of `bitmap_info`, computed once (it compares strings).
+    pixel_offset: (usize, usize, usize, Option<usize>),
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend_mode: CGBlendMode,
     transform: CGAffineTransform,
@@ -426,6 +428,7 @@ impl CGBitmapContextDrawer<'_> {
         let pixels = get_pixels(&bitmap_info, mem);
 
         CGBitmapContextDrawer {
+            pixel_offset: pixel_offsets(&bitmap_info),
             bitmap_info,
             rgb_fill_color,
             blend_mode,
@@ -468,6 +471,7 @@ impl CGBitmapContextDrawer<'_> {
     ) {
         put_pixel(
             &self.bitmap_info,
+            self.pixel_offset,
             self.pixels,
             coords,
             color,

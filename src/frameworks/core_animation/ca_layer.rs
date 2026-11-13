@@ -57,6 +57,10 @@ pub(super) struct CALayerHostObject {
     pub(super) drawable_properties: id,
     /// For CAEAGLLayer only (internal state for compositor)
     pub(super) presented_pixels: Option<(Vec<u8>, u32, u32)>,
+    /// For CAEAGLLayer only, n72 fork: the app's frame copied on the GPU into
+    /// a texture shared with the compositor's context (instead of
+    /// `presented_pixels`): (texture, width, height).
+    pub(super) presented_texture: Option<(crate::gles::gles11_raw::types::GLuint, u32, u32)>,
     /// Internal, only exposed when calling `drawLayer:inContext:`
     pub(super) cg_context: Option<CGContextRef>,
     /// Internal state for compositor
@@ -132,6 +136,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         contents: nil,
         drawable_properties: nil,
         presented_pixels: None,
+        presented_texture: None,
         cg_context: None,
         gles_texture: None,
         gles_texture_is_up_to_date: false,

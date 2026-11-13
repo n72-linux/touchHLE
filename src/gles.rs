@@ -143,6 +143,17 @@ pub fn create_gles1_ctx_no_parent_stack(
     } else {
         GLESImplementation::GLES1_IMPLEMENTATIONS
     };
+    // n72 fork: on the device panel every context joins the share group of
+    // touchHLE's internal (composition) context, so the compositor can draw
+    // an app frame copied on the GPU (eagl.rs). Contexts that already share
+    // with an EAGL sharegroup are in that group too, through it.
+    let n72_share = crate::window::Window::fixed_portrait_panel()
+        && window.has_internal_gl_ctx()
+        && !window.share_with_current_context();
+    if n72_share {
+        let _ = window.make_internal_gl_ctx_current();
+        window.set_share_with_current_context(true);
+    }
     let mut gles1_ctx = None;
     for implementation in list {
         log!("Trying: {}", implementation.description());
@@ -156,6 +167,9 @@ pub fn create_gles1_ctx_no_parent_stack(
                 log!("=> Failed: {}.", err);
             }
         }
+    }
+    if n72_share {
+        window.set_share_with_current_context(false);
     }
     gles1_ctx.expect("Couldn't create OpenGL ES 1.1 context!")
 }

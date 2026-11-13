@@ -1208,6 +1208,16 @@ impl Window {
         self.video_ctx.gl_get_proc_address(procname) as *const _
     }
 
+    /// n72 fork: whether new GL contexts will share with the current one.
+    pub fn share_with_current_context(&self) -> bool {
+        self.video_ctx.gl_attr().share_with_current_context()
+    }
+
+    /// n72 fork: whether the internal (composition) GL context exists yet.
+    pub fn has_internal_gl_ctx(&self) -> bool {
+        self.internal_gl_ins.is_some()
+    }
+
     pub fn set_share_with_current_context(&self, value: bool) {
         self.video_ctx
             .gl_attr()

@@ -526,13 +526,20 @@ unsafe fn composite_layer_recursive(
         false
     };
 
-    let need_texture = host_obj.presented_pixels.is_some()
+    // n72 fork: a frame copied on the GPU into a shared texture is drawn
+    // straight from it.
+    let presented_texture = host_obj.presented_texture.map(|(texture, _, _)| texture);
+    let need_texture = presented_texture.is_some()
+        || host_obj.presented_pixels.is_some()
         || host_obj.contents != nil
         || host_obj.cg_context.is_some();
-    let need_update = need_texture && !host_obj.gles_texture_is_up_to_date;
+    let need_update =
+        need_texture && !host_obj.gles_texture_is_up_to_date && presented_texture.is_none();
 
     if need_texture {
-        if let Some(texture) = host_obj.gles_texture {
+        if let Some(texture) = presented_texture {
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+        } else if let Some(texture) = host_obj.gles_texture {
             gles.BindTexture(gles11::TEXTURE_2D, texture);
         } else {
             assert!(!host_obj.gles_texture_is_up_to_date);
