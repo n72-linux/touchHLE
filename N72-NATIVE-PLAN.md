@@ -7,30 +7,24 @@ same process.
 
 Based on upstream touchHLE `ca1de89` (v0.3.0-11), cloned to `touchHLE/`.
 
-## Status, 2026-11-13 (static work done; nothing has run on the device)
+## Status, 2026-11-13 (device-tested on kernel #26)
 
 | Piece | Where | State |
 | --- | --- | --- |
-| Kernel: user mappings from 0x1000 (`CONFIG_ARM_LOW_USER_MAPPINGS`) | linux-s5l87xx branch `n72-low-user-map` 18333c8c6 (worktree `linux-lowmap`) | Built on kernel #21's config (zImage in the session scratchpad); device test `alpine-work/lowmap-test/lowtest` pending; merge into n72 is the user's call |
-| Fork: features `cpu-dynarmic`/`cpu-native`, native backend, identity-mapped Mem, gates in dyld, fixed portrait panel, evdev accelerometer, `--n72-native-selftest` | touchHLE branch `n72-native` fd7b839 | `cargo check` clean; release build links (12.5 MB, EXEC at 0x70000000); gate assembly checked by disassembly. Not run. The cpu-dynarmic build was not re-checked (needs the dynarmic submodule) |
-| n72-gles: `GL_OES_framebuffer_object` (+ rgb8_rgba8, depth24), y-up FBO targets | n72-gles ec2e835 | 25 new host checks; ARM build clean. Not run on the MBX |
-| n72-gles: `GL_EXT_texture_format_BGRA8888` | n72-gles fc78e04 | host test; ARM build clean |
+| Kernel: user mappings from 0x1000 (`CONFIG_ARM_LOW_USER_MAPPINGS`) | linux-s5l87xx `n72` 2bc56dd3f (kernel #26, booted and staged in alpine-work/kx) | Device: 0x1000 mappable, code runs there, page 0 refused, null reads fault |
+| Fork: native CPU backend, identity Mem, gates, fixed portrait panel, evdev accelerometer, `--n72-native-selftest` | touchHLE branch `n72-native` (fd7b839, 05ffde9) | Self-test 8/8 on the device (calls ARM/Thumb, resume PC, VFP kept, null/udf/bkpt faults, preemption), arena at 0x1000; host call round trip ≈ 510 ns |
+| n72-gles: `GL_OES_framebuffer_object` (+ rgb8_rgba8, depth24), `GL_EXT_texture_format_BGRA8888` | n72-gles ec2e835, fc78e04 | Host 165/165; MBX `tests/fbo_device.c` 16/16. Not installed system-wide yet (tested with LD_LIBRARY_PATH) |
+
+Device facts found: a user `bkpt` arrives as SIGBUS (prefetch abort), the
+trap word 0xe7ffdefe as SIGILL; the ARM1176's VFPv2 has no `vmov #imm`.
+
+Next: install the new n72-gles (apk) after checking n72-ui with it, then
+touchHLE's app picker on the panel, then TestApp.
 
 Build the fork: `. n72/env.sh && cargo build --release --target
 arm-unknown-linux-musleabihf --no-default-features --features cpu-native`
-(needs `alpine-work/sysroot-armhf`, exported from the n72-alpine image with
-sdl2-dev, openal-soft-dev and g++, then pruned). On the device it needs
-Alpine's `sdl2`, `openal-soft-libs`, `libstdc++` and `libgcc`, plus the
-new n72-gles.
-
-First device steps, in order:
-1. Kexec the low-mappings kernel and run `lowtest` (then back to #21).
-2. `touchHLE --n72-native-selftest`: ARM and Thumb host calls, resume PC,
-   VFP preservation, null fault, udf, bkpt (expects SIGTRAP: unverified
-   that Linux reports BKPT that way), preemption, host-call cost.
-3. Install the new n72-gles, check `GL_EXTENSIONS`, run an FBO demo on
-   the MBX (render target memory, the uncached texture path).
-4. touchHLE's app picker, then TestApp.
+(needs `alpine-work/sysroot-armhf`). On the device: Alpine `sdl2`,
+`openal-soft-libs`, `libstdc++`, `libgcc` (installed), plus the new n72-gles.
 
 ## 0. Ground rules for the fork
 
