@@ -130,6 +130,18 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         })
         .collect();
 
+    // n72 fork, debugging aid: dump the layer trees once, at the 60th frame.
+    {
+        static N72_DUMP_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if std::env::var_os("N72_LAYER_DUMP").is_some()
+            && N72_DUMP_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 60
+        {
+            for &layer in &window_layers {
+                super::ca_eagl_layer::n72_dump_layer_tree(env, layer, 0);
+            }
+        }
+    }
+
     let screen_bounds: CGRect = {
         let screen: id = msg_class![env; UIScreen mainScreen];
         msg![env; screen bounds]

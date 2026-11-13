@@ -665,8 +665,23 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     );
 
     // Create a texture with a copy of the pixels in the framebuffer
-    let mut texture: GLuint = 0;
-    gles.GenTextures(1, &mut texture);
+    // n72 fork: on the device panel keep one present texture (all contexts
+    // share objects there) instead of a new one per frame: n72-gles gives a
+    // texture copied into on the GPU linear render-target storage, which is
+    // expensive to set up and free every frame.
+    static N72_PRESENT_TEXTURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let keep_texture = crate::window::Window::fixed_portrait_panel();
+    let mut texture: GLuint = if keep_texture {
+        N72_PRESENT_TEXTURE.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
+    };
+    if texture == 0 || gles.IsTexture(texture) == 0 {
+        gles.GenTextures(1, &mut texture);
+        if keep_texture {
+            N72_PRESENT_TEXTURE.store(texture, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     gles.BindTexture(gles11::TEXTURE_2D, texture);
     gles.CopyTexImage2D(
         gles11::TEXTURE_2D,
@@ -758,8 +773,10 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     // Draw the quad
     present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
 
-    // Clean up the texture
-    gles.DeleteTextures(1, &texture);
+    // Clean up the texture (kept for the next frame on the device panel)
+    if !keep_texture {
+        gles.DeleteTextures(1, &texture);
+    }
 
     // Restore all the state saved before rendering
     for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {

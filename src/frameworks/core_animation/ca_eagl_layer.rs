@@ -96,7 +96,15 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             return nil;
         }
 
-        if let Some(&next) = layer_host_obj.sublayers.last() {
+        // n72 fork: hidden or fully transparent sublayers draw nothing, so
+        // they must not stop the descent (Spore's GL layer carries a hidden
+        // news ticker as its last sublayer, which forced composition every
+        // frame).
+        let visible_last = layer_host_obj.sublayers.iter().rev().copied().find(|&sub| {
+            let h = env.objc.borrow::<CALayerHostObject>(sub);
+            !h.hidden && h.opacity > 0.0
+        });
+        if let Some(next) = visible_last {
             layer = next;
         } else {
             break;
@@ -168,4 +176,46 @@ pub fn present_texture(
     host_obj.presented_texture = Some((texture, width, height));
     host_obj.presented_pixels = None;
     host_obj.gles_texture_is_up_to_date = false;
+}
+
+/// n72 fork, debugging aid: log a window's layer tree (class, geometry,
+/// visibility) once, to see whether an app's GL layer is the bottom-most
+/// full-screen content (N72_LAYER_DUMP).
+pub fn n72_dump_layer_tree(env: &mut Environment, layer: id, depth: usize) {
+    let class: Class = msg![env; layer class];
+    let name = env.objc.get_class_name(class).to_string();
+    let (bounds, position, hidden, opaque, opacity, identity, sublayers, cg, pixels, tex) = {
+        let h = env.objc.borrow::<CALayerHostObject>(layer);
+        (
+            h.bounds,
+            h.position,
+            h.hidden,
+            h.opaque,
+            h.opacity,
+            h.affine_transform.is_identity(),
+            h.sublayers.clone(),
+            h.cg_context.is_some(),
+            h.presented_pixels.is_some(),
+            h.presented_texture.is_some(),
+        )
+    };
+    log!(
+        "n72 layers: {:indent$}{} {:?} bounds {:?} pos {:?} hidden {} opaque {} opacity {} identity {} cg {} eagl-pixels {} eagl-tex {}",
+        "",
+        name,
+        layer,
+        bounds,
+        position,
+        hidden,
+        opaque,
+        opacity,
+        identity,
+        cg,
+        pixels,
+        tex,
+        indent = depth * 2
+    );
+    for sub in sublayers {
+        n72_dump_layer_tree(env, sub, depth + 1);
+    }
 }
