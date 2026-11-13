@@ -91,6 +91,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.framework_state.opengles.current_ctx_for_thread(env.current_thread).unwrap_or(nil)
 }
 + (bool)setCurrentContext:(id)context { // EAGLContext*
+    crate::n72_direct::set_ready(false);
     retain(env, context);
 
     let current_ctx = env.framework_state.opengles.current_ctx_for_thread(env.current_thread);
@@ -278,6 +279,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let fullscreen_layer = find_fullscreen_eagl_layer(env);
+    if crate::dyld::n72_svc_stats_on() {
+        static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n % 200 == 0 {
+            env.dyld.n72_svc_report(200);
+        }
+    }
 
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?

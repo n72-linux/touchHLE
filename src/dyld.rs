@@ -215,6 +215,17 @@ fn write_return_to_host_routine(mem: &mut Mem, svc: u32) -> GuestFunction {
     assert!(!ptr.is_thumb());
     ptr
 }
+#[cfg(feature = "n72-prof")]
+/// n72 fork: calls per linked host function (N72_SVC_STATS=1), reported by
+/// [Dyld::n72_svc_report].
+static N72_SVC_COUNTS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "n72-prof")]
+pub fn n72_svc_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("N72_SVC_STATS").is_some_and(|v| v != "0"))
+}
+
 pub struct Dyld {
     /// List of host functions that have been "linked" and had SVCs assigned.
     ///
@@ -246,6 +257,25 @@ impl Dyld {
     const SYMBOL_STUB1_INSTRUCTIONS: [u32; 1] = [0xe59ff000]; // mask this with lowest 12 bits to restore instructions
     const SYMBOL_STUB_INSTRUCTIONS: [u32; 2] = [0xe59fc000, 0xe59cf000];
     const PIC_SYMBOL_STUB_INSTRUCTIONS: [u32; 3] = [0xe59fc004, 0xe08fc00c, 0xe59cf000];
+
+    #[cfg(feature = "n72-prof")]
+    /// n72 fork: print the most called host functions per frame and reset.
+    pub fn n72_svc_report(&self, frames: u32) {
+        let mut c = N72_SVC_COUNTS.lock().unwrap();
+        let mut v: Vec<(u64, &str)> = c
+            .iter()
+            .enumerate()
+            .filter(|(_, &n)| n > 0)
+            .map(|(i, &n)| (n, self.linked_host_functions[i].0))
+            .collect();
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let total: u64 = v.iter().map(|x| x.0).sum();
+        echo!("n72 svc stats: {} calls/frame over {} frames", total / frames as u64, frames);
+        for (n, name) in v.iter().take(40) {
+            echo!("  {:8.1}  {}", *n as f64 / frames as f64, name);
+        }
+        c.iter_mut().for_each(|x| *x = 0);
+    }
 
     pub fn new() -> Dyld {
         Dyld {
@@ -645,6 +675,15 @@ impl Dyld {
                 let Some(&(symbol, f)) = f else {
                     panic!("Unexpected SVC #{svc} at {svc_pc:#x}");
                 };
+                #[cfg(feature = "n72-prof")]
+                if n72_svc_stats_on() {
+                    let i = ((svc & !Self::SVC_LAZY_LINK_RET_FLAG) - Self::SVC_LINKED_FUNCTIONS_BASE) as usize;
+                    let mut c = N72_SVC_COUNTS.lock().unwrap();
+                    if c.len() <= i {
+                        c.resize(i + 1, 0);
+                    }
+                    c[i] += 1;
+                }
                 log_dbg!("Call to host function, already linked: {}", symbol);
                 Some(f)
             }
@@ -772,6 +811,8 @@ impl Dyld {
             }
 
             cpu.invalidate_cache_range(stub_function_ptr.to_bits(), 4);
+            // n72 fork: hot pure functions are called without the gate.
+            crate::n72_direct::link(mem, symbol, stub_function_ptr.to_bits());
 
             log_dbg!(
                 "Linked {} at {:?} to host implementation",

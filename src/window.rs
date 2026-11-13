@@ -195,12 +195,14 @@ impl GLContext {
         CURRENT_GL_CONTEXT.load(std::sync::atomic::Ordering::Relaxed) == self.1
     }
     fn mark_current(&self) {
+        crate::n72_direct::set_ready(false);
         CURRENT_GL_CONTEXT.store(self.1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 impl Drop for GLContext {
     fn drop(&mut self) {
+        crate::n72_direct::set_ready(false);
         // Deleting the current context leaves none current.
         let _ = CURRENT_GL_CONTEXT.compare_exchange(
             self.1,

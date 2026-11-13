@@ -43,8 +43,12 @@ fn sync_context<'objc, 'win: 'objc>(
     window: &'win mut crate::window::Window,
     current_thread: crate::ThreadId,
 ) -> Box<dyn crate::gles::GLES + 'objc> {
+    crate::n72_direct::resolve_gl(window);
     let gles_ctx = get_thread_context(state, objc, current_thread);
-    gles_ctx.make_current(window)
+    let gles = gles_ctx.make_current(window);
+    // n72 fork: the guest thread's context is current now (direct GL calls).
+    crate::n72_direct::set_ready(true);
+    gles
 }
 
 fn get_thread_context<'objc>(

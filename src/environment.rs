@@ -1525,6 +1525,7 @@ impl Environment {
             new_thread
         );
 
+        crate::n72_direct::set_ready(false); // n72: another thread, maybe another GL context
         let mut guest_ctx = self.threads[new_thread].guest_context.take().unwrap();
         self.cpu.swap_context(&mut guest_ctx);
         assert!(self.threads[self.current_thread].guest_context.is_none());

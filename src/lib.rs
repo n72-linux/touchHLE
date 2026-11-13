@@ -47,6 +47,7 @@ mod matrix;
 mod mem;
 #[cfg(feature = "cpu-native")]
 mod n72_accel;
+mod n72_direct;
 mod objc;
 mod options;
 mod paths;
