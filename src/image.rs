@@ -246,6 +246,23 @@ pub fn gamma_decode(intensity: f32) -> f32 {
     intensity.powf(2.2)
 }
 
+/// [gamma_decode] of an 8-bit component (n72 fork: a table instead of powf
+/// per pixel; software drawing called it six times per pixel).
+pub fn gamma_decode_u8(v: u8) -> f32 {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|i| gamma_decode(i as f32 / 255.0)))[v as usize]
+}
+
+/// [gamma_encode] through a 4096-entry table (n72 fork), close enough for
+/// 8-bit output.
+pub fn gamma_encode_fast(intensity: f32) -> f32 {
+    const N: usize = 4096;
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| (0..=N).map(|i| gamma_encode(i as f32 / N as f32)).collect());
+    let i = (intensity.clamp(0.0, 1.0) * N as f32 + 0.5) as usize;
+    t[i.min(N)]
+}
+
 /// Decodes Imagination Technologies' PVRTC texture compression format to
 /// RGBA (8 bits per channel).
 pub fn decode_pvrtc(pvrtc_data: &[u8], is_2bit: bool, width: u32, height: u32) -> Vec<u32> {

@@ -22,7 +22,7 @@ use super::cg_image::{
 };
 use super::{CGFloat, CGPoint, CGRect};
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::image::{gamma_decode, gamma_encode, Image};
+use crate::image::{gamma_decode, gamma_decode_u8, gamma_encode_fast, Image};
 use crate::mem::{GuestUSize, Mem, MutVoidPtr, Ptr};
 use crate::objc::ObjC;
 use crate::Environment;
@@ -315,28 +315,21 @@ fn pixel_offsets(data: &CGBitmapContextData) -> (usize, usize, usize, Option<usi
 }
 
 /// Get gamma-decoded RGBA value.
-fn get_pixel(
-    data: &CGBitmapContextData,
-    pixels: &mut [u8],
+/// (Takes the component offsets from [pixel_offsets], computed once per pixel.)
+fn get_pixel_at(
+    pixel_offset: (usize, usize, usize, Option<usize>),
+    pixels: &[u8],
     first_component_idx: usize,
 ) -> (f32, f32, f32, f32) {
-    let pixel_offset = pixel_offsets(data);
-    let pixel = (
-        pixels[first_component_idx + pixel_offset.0] as f32 / 255.0,
-        pixels[first_component_idx + pixel_offset.1] as f32 / 255.0,
-        pixels[first_component_idx + pixel_offset.2] as f32 / 255.0,
+    (
+        gamma_decode_u8(pixels[first_component_idx + pixel_offset.0]),
+        gamma_decode_u8(pixels[first_component_idx + pixel_offset.1]),
+        gamma_decode_u8(pixels[first_component_idx + pixel_offset.2]),
         if let Some(alpha_offest) = pixel_offset.3 {
             pixels[first_component_idx + alpha_offest] as f32 / 255.0
         } else {
             1.0
         },
-    );
-
-    (
-        gamma_decode(pixel.0),
-        gamma_decode(pixel.1),
-        gamma_decode(pixel.2),
-        pixel.3,
     )
 }
 
@@ -364,7 +357,8 @@ fn put_pixel(
     let pixel_size = bytes_per_pixel(data);
     let first_component_idx = (y * data.bytes_per_row + x * pixel_size) as usize;
 
-    let bg_pixel = get_pixel(data, pixels, first_component_idx);
+    let pixel_offset = pixel_offsets(data);
+    let bg_pixel = get_pixel_at(pixel_offset, pixels, first_component_idx);
 
     // Blending like this must be done in linear RGB, so this must come before
     // gamma encoding.
@@ -390,8 +384,7 @@ fn put_pixel(
     };
 
     // Alpha is always linear.
-    let (r, g, b) = (gamma_encode(r), gamma_encode(g), gamma_encode(b));
-    let pixel_offset = pixel_offsets(data);
+    let (r, g, b) = (gamma_encode_fast(r), gamma_encode_fast(g), gamma_encode_fast(b));
     match data.alpha_info {
         kCGImageAlphaOnly => {
             pixels[first_component_idx] = (a * 255.0) as u8;

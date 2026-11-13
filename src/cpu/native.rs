@@ -483,6 +483,42 @@ mod signals {
         INSTALL.call_once(|| {});
     }
 
+    // Sampling profiler (env N72_PROF=/path): each time-slice tick records
+    // the interrupted PC (bit 0 = Thumb) and LR of the guest thread, which is
+    // a wall-clock profile (blocked syscalls show at their libc call site).
+    // SIGUSR2, or a full buffer, writes the pairs to the file as raw u32s.
+    #[cfg(target_arch = "arm")]
+    const PROF_MAX: usize = 60_000;
+    #[cfg(target_arch = "arm")]
+    static mut PROF_ON: u32 = 0;
+    #[cfg(target_arch = "arm")]
+    static mut PROF_N: usize = 0;
+    #[cfg(target_arch = "arm")]
+    static mut PROF_DUMPED: u32 = 0;
+    #[cfg(target_arch = "arm")]
+    static mut PROF_BUF: [u32; PROF_MAX * 2] = [0; PROF_MAX * 2];
+    #[cfg(target_arch = "arm")]
+    static mut PROF_PATH: [u8; 128] = [0; 128];
+
+    #[cfg(target_arch = "arm")]
+    unsafe fn prof_dump() {
+        let fd = libc::open(
+            std::ptr::addr_of!(PROF_PATH) as *const libc::c_char,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
+        if fd >= 0 {
+            let n = std::ptr::addr_of!(PROF_N).read_volatile();
+            libc::write(fd, std::ptr::addr_of!(PROF_BUF) as *const _, n * 8);
+            libc::close(fd);
+        }
+    }
+
+    #[cfg(target_arch = "arm")]
+    unsafe extern "C" fn prof_dump_handler(_sig: libc::c_int) {
+        prof_dump();
+    }
+
     #[cfg(target_arch = "arm")]
     fn timer_signal() -> libc::c_int {
         libc::SIGRTMIN() + 3
@@ -530,6 +566,17 @@ mod signals {
                 assert!(libc::sigaction(sig, &sa, std::ptr::null_mut()) == 0);
             }
 
+            if let Ok(path) = std::env::var("N72_PROF") {
+                let b = path.as_bytes();
+                if b.len() < 127 {
+                    let dst = &mut *std::ptr::addr_of_mut!(PROF_PATH);
+                    dst[..b.len()].copy_from_slice(b);
+                    std::ptr::addr_of_mut!(PROF_ON).write_volatile(1);
+                    libc::signal(libc::SIGUSR2, prof_dump_handler as *const () as usize);
+                    log!("n72 profiler on: kill -USR2 {} writes {}", libc::getpid(), path);
+                }
+            }
+
             // Periodic timer aimed at this thread (the one running guests).
             let mut sev: libc::sigevent = std::mem::zeroed();
             sev.sigev_notify = 4; // SIGEV_THREAD_ID (not exported by libc for musl)
@@ -567,6 +614,18 @@ mod signals {
         let in_guest =
             std::ptr::addr_of!(N72_IN_GUEST).read_volatile() != 0 && !asm.contains(&pc);
 
+        if sig == timer_signal() && std::ptr::addr_of!(PROF_ON).read_volatile() != 0 {
+            let n = std::ptr::addr_of!(PROF_N).read_volatile();
+            if n < PROF_MAX {
+                let buf = &mut *std::ptr::addr_of_mut!(PROF_BUF);
+                buf[2 * n] = mc.arm_pc as u32 | ((mc.arm_cpsr as u32 >> 5) & 1);
+                buf[2 * n + 1] = mc.arm_lr as u32;
+                std::ptr::addr_of_mut!(PROF_N).write_volatile(n + 1);
+            } else if std::ptr::addr_of!(PROF_DUMPED).read_volatile() == 0 {
+                std::ptr::addr_of_mut!(PROF_DUMPED).write_volatile(1);
+                prof_dump();
+            }
+        }
         let code = if sig == timer_signal() {
             std::ptr::addr_of_mut!(N72_SLICE_EXPIRED).write_volatile(1);
             if !in_guest {
