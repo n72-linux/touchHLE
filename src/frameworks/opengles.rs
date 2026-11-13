@@ -27,13 +27,13 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 #[derive(Default)]
 pub struct State {
     /// Current EAGLContext for each thread
-    current_ctxs: std::collections::HashMap<crate::ThreadId, Option<crate::objc::id>>,
+    // n72 fork: PtrMap (multiply hash, not SipHash): looked up on every GL call.
+    current_ctxs: crate::objc::PtrMap<crate::ThreadId, Option<crate::objc::id>>,
     strings_cache: std::collections::HashMap<GLenum, ConstPtr<u8>>,
 }
 impl State {
     fn current_ctx_for_thread(&mut self, thread: crate::ThreadId) -> &mut Option<crate::objc::id> {
-        self.current_ctxs.entry(thread).or_insert(None);
-        self.current_ctxs.get_mut(&thread).unwrap()
+        self.current_ctxs.entry(thread).or_insert(None)
     }
 }
 

@@ -246,17 +246,42 @@ impl Font {
         (v_metrics.ascent - v_metrics.descent, v_metrics.line_gap)
     }
 
+    /// n72 fork: rusttype's `layout` without positioning each glyph. Same
+    /// caret, kerning and advance maths as its LayoutIter, but `positioned()`
+    /// computes the glyph's pixel bounds, which in ttf-parser walks the whole
+    /// outline: that was paid for every glyph of every text drawn, every frame.
+    fn layout_unpositioned<'s>(
+        &'s self,
+        text: &'s str,
+        scale: Scale,
+        start: Point<f32>,
+    ) -> impl Iterator<Item = (rusttype::ScaledGlyph<'static>, Point<f32>)> + 's {
+        let mut caret = 0.0f32;
+        let mut last: Option<GlyphId> = None;
+        text.chars().map(move |c| {
+            let g = self.font.glyph(c).scaled(scale);
+            if let Some(l) = last {
+                caret += self.font.pair_kerning(scale, l, g.id());
+            }
+            let p = Point {
+                x: start.x + caret,
+                y: start.y,
+            };
+            caret += g.h_metrics().advance_width;
+            last = Some(g.id());
+            (g, p)
+        })
+    }
+
     /// Calculate the width of a line. This does not handle newlines!
     fn calculate_line_width(&self, font_size: f32, line: &str) -> f32 {
         let mut line_x_min: f32 = 0.0;
         let mut line_x_max: f32 = 0.0;
 
-        for glyph in self
-            .font
-            .layout(line, self.scale(font_size), Default::default())
+        for (glyph, position) in
+            self.layout_unpositioned(line, self.scale(font_size), Default::default())
         {
-            let position = glyph.position();
-            let h_metrics = glyph.unpositioned().h_metrics();
+            let h_metrics = glyph.h_metrics();
 
             // This method used to use pixel_bounding_box() for metrics, but
             // now uses h_metrics() in order to support whitespace characters.
@@ -450,7 +475,7 @@ impl Font {
                 TextAlignment::Center => -line_width / 2.0,
                 TextAlignment::Right => -line_width,
             };
-            for glyph in self.font.layout(
+            for (glyph, pos) in self.layout_unpositioned(
                 line_text,
                 self.scale(font_size),
                 Point {
@@ -460,7 +485,6 @@ impl Font {
             ) {
                 // n72 fork: snap the pen to quarter pixels and reuse the
                 // rasterized glyph for that (glyph, size, sub-position).
-                let pos = glyph.position();
                 let (ix, iy) = (pos.x.floor(), pos.y.floor());
                 let qx = ((pos.x - ix) * 4.0).round() as u8; // 0..=4
                 let qy = ((pos.y - iy) * 4.0).round() as u8;
@@ -470,7 +494,7 @@ impl Font {
                     cache.map.clear();
                 }
                 let cached = cache.map.entry(key).or_insert_with(|| {
-                    let snapped = glyph.unpositioned().clone().positioned(Point {
+                    let snapped = glyph.clone().positioned(Point {
                         x: qx as f32 / 4.0,
                         y: qy as f32 / 4.0,
                     });

@@ -181,11 +181,33 @@ pub enum GLVersion {
     GL21Compat,
 }
 
-pub struct GLContext(sdl2::video::GLContext);
+pub struct GLContext(sdl2::video::GLContext, u32);
+
+/// n72 fork: which [GLContext] touchHLE last made current (its id), so that
+/// checking costs nothing: SDL_GL_GetCurrentContext is a thread-local lookup
+/// through SDL, and touchHLE checks before every guest GL call. All changes of
+/// the current context go through this file (create, make current, drop).
+static CURRENT_GL_CONTEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static NEXT_GL_CONTEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 impl GLContext {
     pub fn is_current(&self) -> bool {
-        self.0.is_current()
+        CURRENT_GL_CONTEXT.load(std::sync::atomic::Ordering::Relaxed) == self.1
+    }
+    fn mark_current(&self) {
+        CURRENT_GL_CONTEXT.store(self.1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for GLContext {
+    fn drop(&mut self) {
+        // Deleting the current context leaves none current.
+        let _ = CURRENT_GL_CONTEXT.compare_exchange(
+            self.1,
+            0,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -1199,7 +1221,13 @@ impl Window {
 
         let gl_ctx = self.window.gl_create_context()?;
 
-        Ok(GLContext(gl_ctx))
+        // SDL makes a new context current.
+        let gl_ctx = GLContext(
+            gl_ctx,
+            NEXT_GL_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        gl_ctx.mark_current();
+        Ok(gl_ctx)
     }
 
     pub fn gl_get_proc_address(&self, procname: &str) -> *const std::ffi::c_void {
@@ -1226,6 +1254,7 @@ impl Window {
 
     pub unsafe fn make_gl_context_current(&self, gl_ctx: &GLContext) {
         self.window.gl_make_current(&gl_ctx.0).unwrap();
+        gl_ctx.mark_current();
     }
 
     /// Make the internal OpenGL ES context (for splash screen and UI rendering)
@@ -1240,7 +1269,10 @@ impl Window {
                 .as_mut()
                 .unwrap()
                 .make_current_unchecked_for_window(
-                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |gl_ctx| {
+                        self.window.gl_make_current(&gl_ctx.0).unwrap();
+                        gl_ctx.mark_current();
+                    },
                     &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
                 )
         };
@@ -1264,7 +1296,10 @@ impl Window {
                 .as_mut()
                 .unwrap()
                 .make_current_unchecked_for_window(
-                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |gl_ctx| {
+                        self.window.gl_make_current(&gl_ctx.0).unwrap();
+                        gl_ctx.mark_current();
+                    },
                     &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
                 );
 
