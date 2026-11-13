@@ -549,6 +549,9 @@ mod signals {
     static mut PROF_ON: u32 = 0;
     #[cfg(target_arch = "arm")]
     static mut PROF_N: usize = 0;
+    /// Ticks (10 ms) still to skip before sampling starts (N72_PROF_SKIP=seconds):
+    /// keeps loading screens out of a profile of the game itself.
+    static mut PROF_SKIP: u32 = 0;
     #[cfg(target_arch = "arm")]
     static mut PROF_DUMPED: u32 = 0;
     #[cfg(target_arch = "arm")]
@@ -628,6 +631,9 @@ mod signals {
                     let dst = &mut *std::ptr::addr_of_mut!(PROF_PATH);
                     dst[..b.len()].copy_from_slice(b);
                     std::ptr::addr_of_mut!(PROF_ON).write_volatile(1);
+                    if let Some(secs) = std::env::var("N72_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()) {
+                        std::ptr::addr_of_mut!(PROF_SKIP).write_volatile(secs * 100);
+                    }
                     libc::signal(libc::SIGUSR2, prof_dump_handler as *const () as usize);
                     log!(
                         "n72 profiler on: kill -USR2 {} writes {}",
@@ -675,7 +681,10 @@ mod signals {
 
         if sig == timer_signal() && std::ptr::addr_of!(PROF_ON).read_volatile() != 0 {
             let n = std::ptr::addr_of!(PROF_N).read_volatile();
-            if n < PROF_MAX {
+            let skip = std::ptr::addr_of!(PROF_SKIP).read_volatile();
+            if skip > 0 {
+                std::ptr::addr_of_mut!(PROF_SKIP).write_volatile(skip - 1);
+            } else if n < PROF_MAX {
                 let buf = &mut *std::ptr::addr_of_mut!(PROF_BUF);
                 buf[2 * n] = mc.arm_pc as u32 | ((mc.arm_cpsr as u32 >> 5) & 1);
                 buf[2 * n + 1] = mc.arm_lr as u32;
