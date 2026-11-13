@@ -155,5 +155,9 @@ pub(super) unsafe fn reserve_guest_arena() -> crate::mem::VAddr {
 #[cfg(feature = "cpu-native")]
 pub(super) unsafe fn protect_none(base: crate::mem::VAddr, size: crate::mem::GuestUSize) {
     let res = unsafe { libc::mprotect(base as usize as *mut _, size as usize, libc::PROT_NONE) };
-    assert!(res == 0, "mprotect failed: {}", std::io::Error::last_os_error());
+    assert!(
+        res == 0,
+        "mprotect failed: {}",
+        std::io::Error::last_os_error()
+    );
 }

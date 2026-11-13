@@ -71,7 +71,7 @@ pub struct ObjC {
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
-    objects: HashMap<id, HostObjectEntry>,
+    objects: PtrMap<id, HostObjectEntry>,
 
     /// Known classes.
     ///
@@ -94,7 +94,7 @@ impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
             selectors: HashMap::new(),
-            objects: HashMap::new(),
+            objects: PtrMap::default(),
             classes: HashMap::new(),
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
@@ -153,3 +153,33 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(sel_registerName(_)),
     export_c_func!(_Block_object_dispose(_, _)),
 ];
+
+/// n72 fork: a `HashMap` for keys that are guest pointers (one u32), hashed
+/// with a multiply instead of SipHash: the object table and the method
+/// tables are looked up on every message send and host object access
+/// (SipHash was ~5% of a profile on the iPod's ARM1176).
+pub type PtrMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<PtrHasher>>;
+
+#[derive(Default)]
+pub struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        // The product's high half is the well-mixed one; hashbrown takes the
+        // bucket from the low bits (on 32-bit hosts also its 7-bit tag), and
+        // guest pointers are 16-byte aligned, so rotate it down.
+        self.0.rotate_left(32)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        // Fibonacci hashing; the high bits matter most to hashbrown.
+        self.0 = (self.0 ^ v as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u32(v as u32);
+    }
+}

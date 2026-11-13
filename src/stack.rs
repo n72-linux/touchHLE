@@ -51,7 +51,9 @@ pub fn prep_stack_for_start(
             reversed_data.push(c);
         }
 
-        let ptr: u32 = (stack_base - reversed_data.len() as u64).try_into().unwrap();
+        let ptr: u32 = (stack_base - reversed_data.len() as u64)
+            .try_into()
+            .unwrap();
         string_ptrs.push(ptr);
     }
 
@@ -83,8 +85,11 @@ pub fn prep_stack_for_start(
         reversed_data.extend_from_slice(ptr.to_be_bytes().as_slice());
     }
 
-    let stack_ptr: MutPtr<u8> =
-        Ptr::from_bits((stack_base - reversed_data.len() as u64).try_into().unwrap());
+    let stack_ptr: MutPtr<u8> = Ptr::from_bits(
+        (stack_base - reversed_data.len() as u64)
+            .try_into()
+            .unwrap(),
+    );
     let stack_height: GuestUSize = reversed_data.len().try_into().unwrap();
 
     assert!(stack_height < Mem::MAIN_THREAD_STACK_SIZE);

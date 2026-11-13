@@ -384,7 +384,11 @@ fn put_pixel(
     };
 
     // Alpha is always linear.
-    let (r, g, b) = (gamma_encode_fast(r), gamma_encode_fast(g), gamma_encode_fast(b));
+    let (r, g, b) = (
+        gamma_encode_fast(r),
+        gamma_encode_fast(g),
+        gamma_encode_fast(b),
+    );
     match data.alpha_info {
         kCGImageAlphaOnly => {
             pixels[first_component_idx] = (a * 255.0) as u8;
@@ -483,6 +487,73 @@ impl CGBitmapContextDrawer<'_> {
             blend,
             self.blend_mode,
         )
+    }
+
+    /// n72 fork: the pixels [Self::iter_transformed_pixels] would visit for an
+    /// axis-aligned transform, set to zero a row span at a time (what
+    /// put_pixel writes for a clear). Returns false (nothing done) otherwise.
+    pub fn clear_rect_axis_aligned(&mut self, untransformed_rect: CGRect) -> bool {
+        let t = self.transform;
+        if t.b != 0.0 || t.c != 0.0 || t.a == 0.0 || t.d == 0.0 {
+            return false;
+        }
+        let bounding_rect = t.apply_to_rect(untransformed_rect);
+        let x_start = bounding_rect.origin.x.round().max(0.0) as GuestUSize;
+        let y_start = bounding_rect.origin.y.round().max(0.0) as GuestUSize;
+        let x_end = (bounding_rect.origin.x + bounding_rect.size.width)
+            .round()
+            .min(self.width() as f32) as GuestUSize;
+        let y_end = (bounding_rect.origin.y + bounding_rect.size.height)
+            .round()
+            .min(self.height() as f32) as GuestUSize;
+        let inverse = t.invert();
+        // Same inside test as iter_transformed_pixels; with b = c = 0 it is
+        // separable, so it is done once per column and once per row.
+        let inside_x = |x: GuestUSize| {
+            let u = inverse.apply_to_point(CGPoint {
+                x: x as f32 + 0.5,
+                y: 0.5,
+            });
+            let w = (u.x - untransformed_rect.origin.x) / untransformed_rect.size.width;
+            (0.0..1.0).contains(&w)
+        };
+        let inside_y = |y: GuestUSize| {
+            let u = inverse.apply_to_point(CGPoint {
+                x: 0.5,
+                y: y as f32 + 0.5,
+            });
+            let w = (u.y - untransformed_rect.origin.y) / untransformed_rect.size.height;
+            (0.0..1.0).contains(&w)
+        };
+        let xs: Vec<GuestUSize> = (x_start..x_end).filter(|&x| inside_x(x)).collect();
+        let (Some(&x0), Some(&x1)) = (xs.first(), xs.last()) else {
+            return true; // nothing inside
+        };
+        if (x1 - x0 + 1) as usize != xs.len() {
+            return false; // not a single span (cannot happen; be safe)
+        }
+        let px = self.pixel_size;
+        let alpha_only = self.bitmap_info.alpha_info == kCGImageAlphaOnly;
+        let (width, height, bpr) = (
+            self.bitmap_info.width,
+            self.bitmap_info.height,
+            self.bitmap_info.bytes_per_row,
+        );
+        assert!(x1 < width);
+        for y in (y_start..y_end).filter(|&y| inside_y(y)) {
+            // Rows are stored top to bottom (see put_pixel).
+            let row = (height - 1 - y) * bpr;
+            if alpha_only {
+                for x in x0..=x1 {
+                    self.pixels[(row + x * px) as usize] = 0;
+                }
+            } else {
+                let a = (row + x0 * px) as usize;
+                let b = (row + (x1 + 1) * px) as usize;
+                self.pixels[a..b].fill(0);
+            }
+        }
+        true
     }
 
     /// Takes a [CGRect] and applies the current transform to it, and iterates
@@ -630,6 +701,11 @@ fn test_iter_transformed_pixels() {
 pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRect, clear: bool) {
     n72_cg_stats::op(if clear { "clear" } else { "fill" });
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    // n72 fork: clearing an axis-aligned rectangle zeroes whole row spans
+    // instead of blending pixel by pixel (Spore clears ~13k pixels a frame).
+    if clear && drawer.clear_rect_axis_aligned(rect) {
+        return;
+    }
     let color = if clear {
         (0.0, 0.0, 0.0, 0.0)
     } else {

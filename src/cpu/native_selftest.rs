@@ -66,8 +66,13 @@ pub fn run_selftest() -> i32 {
 
     // Layout inside one 64 KiB chunk near the bottom of the arena.
     let base = mem.vm_alloc(None, 0x10000).unwrap().to_bits();
-    let (done, site, arm_fn, thumb_fn, stack_top) =
-        (base, base + 0x100, base + 0x200, base + 0x400, base + 0x10000);
+    let (done, site, arm_fn, thumb_fn, stack_top) = (
+        base,
+        base + 0x100,
+        base + 0x200,
+        base + 0x400,
+        base + 0x10000,
+    );
 
     // "Return to host" routine: site with SVC_DONE, then a trap.
     put(&mut mem, done, &[0, 0xe7ff_defe]);
@@ -83,7 +88,7 @@ pub fn run_selftest() -> i32 {
         &mut mem,
         arm_fn,
         &[
-            0xe92d_4000, // push {lr}
+            0xe92d_4000,                                                             // push {lr}
             0xe3a0_1101, // mov r1, #0x40000000
             0xe3a0_2000, // mov r2, #0
             0xec41_2b18, // vmov d8, r2, r1
@@ -93,10 +98,10 @@ pub fn run_selftest() -> i32 {
             0xe3a0_1101, // mov r1, #0x40000000
             0xe3a0_2000, // mov r2, #0
             0xec41_2b17, // vmov d7, r2, r1
-            0xeeb4_8b47,                                              // vcmp.f64 d8, d7
-            0xeef1_fa10,                                              // vmrs APSR_nzcv, fpscr
-            0x0280_0064,                                              // addeq r0, r0, #100
-            0xe8bd_8000,                                              // pop {pc}
+            0xeeb4_8b47, // vcmp.f64 d8, d7
+            0xeef1_fa10, // vmrs APSR_nzcv, fpscr
+            0x0280_0064, // addeq r0, r0, #100
+            0xe8bd_8000, // pop {pc}
         ],
     );
     let regs = cpu.regs_mut();
@@ -116,7 +121,10 @@ pub fn run_selftest() -> i32 {
     );
     t.check(
         cpu.regs()[0] == 151,
-        &format!("ARM result r0 = {} (expect 151: 5*10+1, d8 kept)", cpu.regs()[0]),
+        &format!(
+            "ARM result r0 = {} (expect 151: 5*10+1, d8 kept)",
+            cpu.regs()[0]
+        ),
     );
     t.check(cpu.regs()[15] == done + 4, "PC after an SVC is site + 4");
 
@@ -128,7 +136,7 @@ pub fn run_selftest() -> i32 {
         &[
             0xb500, // push {lr}
             0x2003, // movs r0, #3
-            0, 0,   // blx site (below)
+            0, 0,      // blx site (below)
             0x3002, // adds r0, #2
             0xbd00, // pop {pc}
         ],
@@ -139,7 +147,9 @@ pub fn run_selftest() -> i32 {
     let regs = cpu.regs_mut();
     regs[13] = stack_top;
     regs[14] = done;
-    cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(thumb_fn | 1));
+    cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(
+        thumb_fn | 1,
+    ));
     let (state, calls) = run(&mut cpu, &mut mem, 10);
     t.check(
         matches!(state, CpuState::Svc(SVC_DONE)) && calls == 1 && cpu.regs()[0] == 32,
@@ -149,8 +159,16 @@ pub fn run_selftest() -> i32 {
     // Faults: a null read, an undefined instruction, a breakpoint.
     let fault_fn = base + 0x600;
     for (code, expect, name) in [
-        (0xe3a0_1000u32, CpuError::MemoryError, "null read -> MemoryError"), // mov r1,#0 then ldr
-        (0xe7f0_00f0, CpuError::UndefinedInstruction, "udf -> UndefinedInstruction"),
+        (
+            0xe3a0_1000u32,
+            CpuError::MemoryError,
+            "null read -> MemoryError",
+        ), // mov r1,#0 then ldr
+        (
+            0xe7f0_00f0,
+            CpuError::UndefinedInstruction,
+            "udf -> UndefinedInstruction",
+        ),
         (0xe120_0070, CpuError::Breakpoint, "bkpt -> Breakpoint"),
     ] {
         let words: &[u32] = if expect == CpuError::MemoryError {
@@ -163,7 +181,9 @@ pub fn run_selftest() -> i32 {
         let regs = cpu.regs_mut();
         regs[13] = stack_top;
         regs[14] = done;
-        cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(fault_fn));
+        cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(
+            fault_fn,
+        ));
         let mut ticks = 100_000u64;
         let state = cpu.run_or_step(&mut mem, Some(&mut ticks));
         t.check(
@@ -234,7 +254,14 @@ pub fn run_selftest() -> i32 {
     );
 
     // Host-call round trip cost.
-    put(&mut mem, arm_fn, &[0xeb00_0000 | ((site.wrapping_sub(arm_fn + 8) >> 2) & 0x00ff_ffff), 0xeaff_fffd]); // bl site; b arm_fn
+    put(
+        &mut mem,
+        arm_fn,
+        &[
+            0xeb00_0000 | ((site.wrapping_sub(arm_fn + 8) >> 2) & 0x00ff_ffff),
+            0xeaff_fffd,
+        ],
+    ); // bl site; b arm_fn
     flush(arm_fn, 8);
     cpu.regs_mut()[13] = stack_top;
     cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(arm_fn));

@@ -573,7 +573,11 @@ mod signals {
                     dst[..b.len()].copy_from_slice(b);
                     std::ptr::addr_of_mut!(PROF_ON).write_volatile(1);
                     libc::signal(libc::SIGUSR2, prof_dump_handler as *const () as usize);
-                    log!("n72 profiler on: kill -USR2 {} writes {}", libc::getpid(), path);
+                    log!(
+                        "n72 profiler on: kill -USR2 {} writes {}",
+                        libc::getpid(),
+                        path
+                    );
                 }
             }
 
@@ -611,8 +615,7 @@ mod signals {
         let mc = &mut uc.uc_mcontext;
         let pc = mc.arm_pc as usize;
         let asm = (&n72_asm_start as *const u8 as usize)..(&n72_asm_end as *const u8 as usize);
-        let in_guest =
-            std::ptr::addr_of!(N72_IN_GUEST).read_volatile() != 0 && !asm.contains(&pc);
+        let in_guest = std::ptr::addr_of!(N72_IN_GUEST).read_volatile() != 0 && !asm.contains(&pc);
 
         if sig == timer_signal() && std::ptr::addr_of!(PROF_ON).read_volatile() != 0 {
             let n = std::ptr::addr_of!(PROF_N).read_volatile();
@@ -708,7 +711,11 @@ mod signals {
         // Like dynarmic: after an undefined instruction or breakpoint the PC
         // points past it (Environment::debug_cpu_error steps back).
         if code == EXIT_UNDEFINED || code == EXIT_BREAKPOINT {
-            ctx.regs[15] += if ctx.cpsr & Cpu::CPSR_THUMB != 0 { 2 } else { 4 };
+            ctx.regs[15] += if ctx.cpsr & Cpu::CPSR_THUMB != 0 {
+                2
+            } else {
+                4
+            };
         }
         let space = uc.uc_regspace.as_ptr() as *const u32;
         let mut off = 0usize;

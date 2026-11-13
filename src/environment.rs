@@ -531,8 +531,7 @@ impl Environment {
                     // it some room.
                     // (n72 fork: relative to the stack top, which is not the
                     // top of the address space with the native backend.)
-                    env.cpu.regs_mut()[Cpu::SP] =
-                        (mem::Mem::MAIN_THREAD_STACK_TOP - 0x1000) as u32;
+                    env.cpu.regs_mut()[Cpu::SP] = (mem::Mem::MAIN_THREAD_STACK_TOP - 0x1000) as u32;
 
                     // Call `+load` method on classes where it's defined.
                     // TODO: `+load` methods from our image should take priority
@@ -662,7 +661,9 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_BYTE),
+            stack: Some(
+                mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_BYTE,
+            ),
             framework_state: Default::default(),
         };
 
@@ -794,7 +795,9 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: None,
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_BYTE),
+            stack: Some(
+                mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_BYTE,
+            ),
             framework_state: Default::default(),
         };
 

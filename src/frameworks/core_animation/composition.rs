@@ -152,10 +152,23 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
+    // n72 fork: on the device's own panel (no scaling, no rotation, no
+    // virtual cursor) draw straight into the window's framebuffer: the
+    // render-to-texture pass plus the present pass cost the MBX a whole extra
+    // full-screen render per frame.
+    let direct_to_window = crate::window::Window::fixed_portrait_panel()
+        && present_frame_args.0 == (0, 0, fb_width, fb_height)
+        && present_frame_args.2.is_none();
+
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
-    let texture = if let Some((texture, framebuffer)) = env
+    let texture = if direct_to_window {
+        unsafe {
+            gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+        }
+        0
+    } else if let Some((texture, framebuffer)) = env
         .framework_state
         .core_animation
         .composition
@@ -359,15 +372,18 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     // Present our rendered frame (bound to TEXTURE_2D). This copies it to the
     // default framebuffer (0) so we need to unbind our internal framebuffer.
-    unsafe {
-        gles.BindTexture(gles11::TEXTURE_2D, texture);
-        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
-        present_frame(
-            gles.as_mut(),
-            present_frame_args.0,
-            present_frame_args.1,
-            present_frame_args.2,
-        );
+    // (Already there when drawing straight to the window.)
+    if !direct_to_window {
+        unsafe {
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+            gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+            present_frame(
+                gles.as_mut(),
+                present_frame_args.0,
+                present_frame_args.1,
+                present_frame_args.2,
+            );
+        }
     }
     std::mem::drop(gles);
     window.swap_window();

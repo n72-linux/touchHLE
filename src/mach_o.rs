@@ -268,9 +268,15 @@ impl MachO {
                     // n72 fork: the native backend runs on an ARMv6 CPU
                     // (ARM1176), which cannot run armv7 code.
                     let (preferred, other) = if cfg!(feature = "cpu-native") {
-                        (mach_object::CPU_SUBTYPE_ARM_V6, mach_object::CPU_SUBTYPE_ARM_V7)
+                        (
+                            mach_object::CPU_SUBTYPE_ARM_V6,
+                            mach_object::CPU_SUBTYPE_ARM_V7,
+                        )
                     } else {
-                        (mach_object::CPU_SUBTYPE_ARM_V7, mach_object::CPU_SUBTYPE_ARM_V6)
+                        (
+                            mach_object::CPU_SUBTYPE_ARM_V7,
+                            mach_object::CPU_SUBTYPE_ARM_V6,
+                        )
                     };
                     if arch.cpusubtype == preferred
                         || (arch.cpusubtype == other && best_type != Some(preferred))

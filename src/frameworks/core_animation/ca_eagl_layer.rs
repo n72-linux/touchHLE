@@ -139,7 +139,10 @@ pub fn present_pixels(env: &mut Environment, layer: id, pixels: Vec<u8>, width: 
 
 /// n72 fork: the texture (shared with the compositor) that last held this
 /// layer's frame, to be reused for the next one.
-pub fn presented_texture_for(env: &mut Environment, layer: id) -> Option<crate::gles::gles11_raw::types::GLuint> {
+pub fn presented_texture_for(
+    env: &mut Environment,
+    layer: id,
+) -> Option<crate::gles::gles11_raw::types::GLuint> {
     env.objc
         .borrow::<CALayerHostObject>(layer)
         .presented_texture

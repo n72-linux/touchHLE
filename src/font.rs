@@ -464,12 +464,7 @@ impl Font {
                 let (ix, iy) = (pos.x.floor(), pos.y.floor());
                 let qx = ((pos.x - ix) * 4.0).round() as u8; // 0..=4
                 let qy = ((pos.y - iy) * 4.0).round() as u8;
-                let key: GlyphKey = (
-                    glyph.id().0,
-                    glyph.scale().x.to_bits(),
-                    qx,
-                    qy,
-                );
+                let key: GlyphKey = (glyph.id().0, glyph.scale().x.to_bits(), qx, qy);
                 let mut cache = self.glyph_cache.borrow_mut();
                 if cache.map.len() >= GlyphCache::MAX_ENTRIES {
                     cache.map.clear();
