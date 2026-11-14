@@ -45,7 +45,7 @@ pub struct OpenALContext {
 
 /// n72 fork: the one host device that every context is made on, touchHLE's
 /// own (audio queues, system sounds) and those of the app's OpenAL devices
-/// alike, or `None` with N72_AL_SHARED=0.
+/// alike (`None` on non-native backends).
 ///
 /// Each OpenAL Soft device has a mixer thread of its own that renders and
 /// converts its output and feeds its own ALSA stream whether or not anything
@@ -56,10 +56,7 @@ pub struct OpenALContext {
 pub fn shared_device() -> Option<*mut ALCdevice> {
     use std::sync::atomic::{AtomicPtr, Ordering};
     static DEVICE: AtomicPtr<ALCdevice> = AtomicPtr::new(std::ptr::null_mut());
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| {
-        cfg!(feature = "cpu-native") && !std::env::var_os("N72_AL_SHARED").is_some_and(|v| v == "0")
-    }) {
+    if !cfg!(feature = "cpu-native") {
         return None;
     }
     let mut device = DEVICE.load(Ordering::Relaxed);
@@ -78,12 +75,21 @@ pub fn shared_device() -> Option<*mut ALCdevice> {
 /// them flat out. ALSA's default follows the route (n72-audio-route), so
 /// reopening the device on the default output (ALC_SOFT_reopen_device:
 /// its contexts, sources and buffers stay) puts the sound back, on the
-/// same settings (alsoft.conf). Checked on every 512th context switch,
-/// which every AL call makes, so no clock is read for it.
+/// same settings (alsoft.conf).
+///
+/// Looked at on every 64th context switch, which every AL call makes, so
+/// no clock is read for it: an app in that refill loop gets there within a
+/// frame, and one that makes few AL calls (loading) is not stalled by its
+/// sound anyway. A reopen that fails is tried again at the next look; the
+/// log has a line when the state changes, not one per try.
 fn check_shared_device(device: *mut ALCdevice) {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
-    if CALLS.fetch_add(1, Ordering::Relaxed) % 512 != 0 {
+    static FAILING: AtomicBool = AtomicBool::new(false);
+    if CALLS.fetch_add(1, Ordering::Relaxed) % 64 != 0 {
+        return;
+    }
+    if shared_device() != Some(device) {
         return;
     }
     let mut connected: ALCint = 1;
@@ -104,11 +110,13 @@ fn check_shared_device(device: *mut ALCdevice) {
             std::ptr::null(),
             std::ptr::null(),
         )
-    };
-    log!(
-        "n72: the audio output went away; reopening OpenAL on the default output: {}",
-        if ok == ALC_TRUE { "done" } else { "failed (checking again later)" }
-    );
+    } == ALC_TRUE;
+    let was_failing = FAILING.swap(!ok, Ordering::Relaxed);
+    if ok {
+        log!("n72: the audio output went away; OpenAL reopened on the default output");
+    } else if !was_failing {
+        log!("n72: the audio output went away and the default output could not be opened; trying again as the app plays");
+    }
 }
 
 impl OpenALContext {
@@ -145,9 +153,7 @@ impl OpenALContext {
         // check ourselves.
         let ret = unsafe { al_sys::alcMakeContextCurrent(self.context) };
         assert!(ret == ALC_TRUE);
-        if shared_device() == Some(self.device) {
-            check_shared_device(self.device);
-        }
+        check_shared_device(self.device);
         OpenAL {
             _al_lifetime: PhantomData,
         }
