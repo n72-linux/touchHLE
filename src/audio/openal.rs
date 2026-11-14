@@ -70,6 +70,47 @@ pub fn shared_device() -> Option<*mut ALCdevice> {
     Some(device)
 }
 
+/// n72 fork: keep the shared device on a working output. ALSA's default
+/// can go away under it (a Bluetooth speaker that disconnects, bluealsa's
+/// PCM with it: OpenAL Soft logs "Invalid state detected: No such device"
+/// and marks the device disconnected); its sources then stop and report
+/// their buffers processed, and an app's audio queue refills and restarts
+/// them flat out. ALSA's default follows the route (n72-audio-route), so
+/// reopening the device on the default output (ALC_SOFT_reopen_device:
+/// its contexts, sources and buffers stay) puts the sound back, on the
+/// same settings (alsoft.conf). Checked on every 512th context switch,
+/// which every AL call makes, so no clock is read for it.
+fn check_shared_device(device: *mut ALCdevice) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) % 512 != 0 {
+        return;
+    }
+    let mut connected: ALCint = 1;
+    unsafe {
+        touchHLE_openal_soft_wrapper::alcGetIntegerv(
+            device,
+            touchHLE_openal_soft_wrapper::alc_defines::ALC_CONNECTED,
+            1,
+            &mut connected,
+        )
+    };
+    if connected != 0 {
+        return;
+    }
+    let ok = unsafe {
+        touchHLE_openal_soft_wrapper::alcReopenDeviceSOFT(
+            device,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    log!(
+        "n72: the audio output went away; reopening OpenAL on the default output: {}",
+        if ok == ALC_TRUE { "done" } else { "failed (checking again later)" }
+    );
+}
+
 impl OpenALContext {
     pub fn new(_manager: &mut OpenALManager) -> Result<Self, String> {
         let device = shared_device().unwrap_or_else(|| unsafe { al_sys::alcOpenDevice(std::ptr::null()) });
@@ -104,6 +145,9 @@ impl OpenALContext {
         // check ourselves.
         let ret = unsafe { al_sys::alcMakeContextCurrent(self.context) };
         assert!(ret == ALC_TRUE);
+        if shared_device() == Some(self.device) {
+            check_shared_device(self.device);
+        }
         OpenAL {
             _al_lifetime: PhantomData,
         }

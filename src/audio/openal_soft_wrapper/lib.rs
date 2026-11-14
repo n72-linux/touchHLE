@@ -65,6 +65,9 @@ pub mod alc_defines {
     pub const ALC_INVALID_ENUM: ALCenum = 0xA003;
     pub const ALC_INVALID_VALUE: ALCenum = 0xA004;
     pub const ALC_OUT_OF_MEMORY: ALCenum = 0xA005;
+
+    // ALC_EXT_disconnect (alext.h)
+    pub const ALC_CONNECTED: ALCenum = 0x313;
 }
 
 extern "C" {
@@ -84,6 +87,19 @@ extern "C" {
     pub fn alcGetError(device: *mut ALCdevice) -> ALCenum;
 
     pub fn alcGetString(device: *mut ALCdevice, param: ALCenum) -> *const ALCchar;
+    pub fn alcGetIntegerv(
+        device: *mut ALCdevice,
+        param: ALCenum,
+        size: ALCsizei,
+        values: *mut ALCint,
+    );
+
+    // ALC_SOFT_reopen_device (alext.h; OpenAL Soft 1.22)
+    pub fn alcReopenDeviceSOFT(
+        device: *mut ALCdevice,
+        deviceName: *const ALCchar,
+        attribs: *const ALCint,
+    ) -> ALCboolean;
 }
 
 // === al.h ===
