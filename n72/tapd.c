@@ -7,7 +7,13 @@
  *   echo "hold 160 240 800" > /tmp/n72-tap           (x y ms)
  *
  * Coordinates are panel pixels (320 x 480, portrait). SDL's evdev backend
- * sees a direct multitouch device like the real one.
+ * sees a direct multitouch device, with slots (multitouch protocol B).
+ *
+ *   n72-tapd -a /tmp/n72-tap        the same in protocol A, as the N72's
+ * zephyr2 driver reported until 2026-11: no slots, the contact with its
+ * tracking id in every frame, SYN_MT_REPORT after it. SDL 2 turns each such
+ * frame into a finger-down (and a finger-up for the one before), so a swipe
+ * reaches an application as taps: the control for that bug.
  */
 #include <fcntl.h>
 #include <linux/uinput.h>
@@ -20,6 +26,7 @@
 #include <unistd.h>
 
 static int fd;
+static int proto_a;
 
 static void ev(int type, int code, int value)
 {
@@ -42,6 +49,18 @@ static void msleep(int ms)
 
 static void down(int x, int y, int first)
 {
+	if (proto_a) {
+		/* every frame carries the whole contact */
+		ev(EV_ABS, ABS_MT_TRACKING_ID, 1);
+		ev(EV_ABS, ABS_MT_POSITION_X, x);
+		ev(EV_ABS, ABS_MT_POSITION_Y, y);
+		ev(EV_SYN, SYN_MT_REPORT, 0);
+		ev(EV_ABS, ABS_X, x);
+		ev(EV_ABS, ABS_Y, y);
+		ev(EV_KEY, BTN_TOUCH, 1);
+		ev(EV_SYN, SYN_REPORT, 0);
+		return;
+	}
 	if (first) {
 		ev(EV_ABS, ABS_MT_SLOT, 0);
 		ev(EV_ABS, ABS_MT_TRACKING_ID, 1);
@@ -57,6 +76,12 @@ static void down(int x, int y, int first)
 
 static void up(void)
 {
+	if (proto_a) {
+		ev(EV_SYN, SYN_MT_REPORT, 0);
+		ev(EV_KEY, BTN_TOUCH, 0);
+		ev(EV_SYN, SYN_REPORT, 0);
+		return;
+	}
 	ev(EV_ABS, ABS_MT_SLOT, 0);
 	ev(EV_ABS, ABS_MT_TRACKING_ID, -1);
 	ev(EV_KEY, BTN_TOUCH, 0);
@@ -75,7 +100,14 @@ static void absax(int code, int max)
 
 int main(int argc, char **argv)
 {
-	const char *fifo = argc > 1 ? argv[1] : "/tmp/n72-tap";
+	const char *fifo;
+
+	if (argc > 1 && !strcmp(argv[1], "-a")) {
+		proto_a = 1;
+		argv++;
+		argc--;
+	}
+	fifo = argc > 1 ? argv[1] : "/tmp/n72-tap";
 	struct uinput_setup us;
 	char line[128];
 
@@ -89,7 +121,8 @@ int main(int argc, char **argv)
 	ioctl(fd, UI_SET_EVBIT, EV_ABS);
 	ioctl(fd, UI_SET_ABSBIT, ABS_X);
 	ioctl(fd, UI_SET_ABSBIT, ABS_Y);
-	ioctl(fd, UI_SET_ABSBIT, ABS_MT_SLOT);
+	if (!proto_a)
+		ioctl(fd, UI_SET_ABSBIT, ABS_MT_SLOT);
 	ioctl(fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
 	ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
 	ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
@@ -98,13 +131,14 @@ int main(int argc, char **argv)
 	absax(ABS_Y, 479);
 	absax(ABS_MT_POSITION_X, 319);
 	absax(ABS_MT_POSITION_Y, 479);
-	absax(ABS_MT_SLOT, 1);
+	if (!proto_a)
+		absax(ABS_MT_SLOT, 1);
 	absax(ABS_MT_TRACKING_ID, 65535);
 	memset(&us, 0, sizeof(us));
 	us.id.bustype = BUS_VIRTUAL;
 	us.id.vendor = 0x7272;
 	us.id.product = 1;
-	strcpy(us.name, "n72-tapd virtual touchscreen");
+	strcpy(us.name, proto_a ? "n72-tapd virtual touchscreen (protocol A)" : "n72-tapd virtual touchscreen");
 	ioctl(fd, UI_DEV_SETUP, &us);
 	if (ioctl(fd, UI_DEV_CREATE) < 0) {
 		perror("UI_DEV_CREATE");

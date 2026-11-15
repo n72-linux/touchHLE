@@ -110,6 +110,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 /// [super::handle_events] will forward touch events to this function.
 pub fn handle_event(env: &mut Environment, event: Event) {
+    // n72 fork: N72_LOG_TOUCH=1 logs what reaches the app (a drag must show
+    // as one down, moves, one up; a touch screen in multitouch protocol A
+    // came through SDL as a down and an up per frame).
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("N72_LOG_TOUCH").is_some_and(|v| v != "0")) {
+            let (kind, map) = match &event {
+                Event::TouchesDown(map) => ("down", map),
+                Event::TouchesMove(map) => ("move", map),
+                Event::TouchesUp(map) => ("up", map),
+                _ => unreachable!(),
+            };
+            for (finger, coords) in map {
+                log!("n72 touch {} {:?} at {:.0}, {:.0}", kind, finger, coords.0, coords.1);
+            }
+        }
+    }
     // before processing anything, we mark all current touches as stationary
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
     for &touch in (*current_touches).values() {
