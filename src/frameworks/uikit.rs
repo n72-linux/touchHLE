@@ -98,6 +98,13 @@ pub struct State {
     ui_responder: ui_responder::State,
 }
 
+/// n72 fork: for EAGLContext presentRenderbuffer: the app drew a frame.
+pub fn n72_frame_presented(env: &mut Environment) {
+    let state = &mut env.framework_state.uikit.ui_touch;
+    state.frames_presented += 1;
+    state.last_present = Some(Instant::now());
+}
+
 /// For use by `NSRunLoop`: handles any events that have queued up.
 ///
 /// Returns the next time this function must be called, if any, e.g. the next
@@ -106,8 +113,18 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     use crate::window::Event;
     use crate::window::TextInputEvent;
 
+    // n72 fork: a touch-up held back for the app's next frame (see
+    // ui_touch::should_hold_up); it and every later event wait in the queue.
+    let mut held_until = None;
     // NSRunLoop will never call this function in headless mode.
     while let Some(event) = env.window_mut().pop_event() {
+        if let Event::TouchesUp(map) = &event {
+            if let Some(until) = ui_touch::should_hold_up(env, map) {
+                env.window_mut().unpop_event(event);
+                held_until = Some(until.min(Instant::now() + std::time::Duration::from_millis(10)));
+                break;
+            }
+        }
         match event {
             Event::Quit => {
                 echo!("User requested quit, exiting.");
@@ -169,5 +186,9 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
         }
     }
 
-    ui_accelerometer::handle_accelerometer(env)
+    let next_due = ui_accelerometer::handle_accelerometer(env);
+    match (next_due, held_until) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }

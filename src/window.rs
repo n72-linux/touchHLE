@@ -924,6 +924,12 @@ impl Window {
             .or_else(|| self.event_queue.pop_front())
     }
 
+    /// n72 fork: put an event back at the front of the queue, to be popped
+    /// next (a touch-up waiting for the app's next frame).
+    pub fn unpop_event(&mut self, event: Event) {
+        self.event_queue.push_front(event);
+    }
+
     fn controller_added(&mut self, joystick_idx: u32) {
         let Ok(controller) = self.controller_ctx.open(joystick_idx) else {
             log!("Warning: A new controller was connected, but it couldn't be accessed!");

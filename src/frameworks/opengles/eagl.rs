@@ -278,6 +278,10 @@ pub const CLASSES: ClassExports = objc_classes! {
             .count_frame(format_args!("EAGLContext {this:?}"));
     }
 
+    // n72 fork: frames presented, for touch-ups that wait for one
+    // (uikit::ui_touch::should_hold_up).
+    crate::frameworks::uikit::n72_frame_presented(env);
+
     let fullscreen_layer = find_fullscreen_eagl_layer(env);
     // n72 fork: a build instrumented for a profile (n72/pgo/README) writes
     // its counters every 256 frames; test runs end with a kill.

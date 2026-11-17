@@ -17,6 +17,7 @@ use crate::window::{Coords, Event, FingerId};
 use crate::Environment;
 use std::collections::hash_map::{Entry, HashMap};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 pub type UITouchPhase = NSInteger;
 pub const UITouchPhaseBegan: UITouchPhase = 0;
@@ -27,6 +28,41 @@ pub const UITouchPhaseEnded: UITouchPhase = 3;
 #[derive(Default)]
 pub struct State {
     current_touches: HashMap<FingerId, id>,
+    /// n72 fork: frames the app has presented (EAGLContext
+    /// presentRenderbuffer), and when it last did.
+    pub frames_presented: u64,
+    pub last_present: Option<Instant>,
+    /// n72 fork: for each finger down, the frame count and time when the app
+    /// got its touchesBegan.
+    down_at: HashMap<FingerId, (u64, Instant)>,
+}
+
+/// n72 fork: how long a touch-up may wait for the app to draw a frame with
+/// the finger down. A game that reads touches once per frame (Spore) misses a
+/// tap whose down and up both arrive between two of its frames: touchHLE
+/// hands it every queued event at once, and at 20 FPS a quick tap fits in a
+/// frame. The real OS delivers each event when it happens.
+const TAP_HOLD_MAX: Duration = Duration::from_millis(250);
+
+/// n72 fork: for [super::handle_events]: should this touch-up wait, because
+/// a finger in it went down after the app's last frame? Only while the app is
+/// drawing frames (an app that presents none would only get later ups).
+pub fn should_hold_up(env: &Environment, map: &HashMap<FingerId, Coords>) -> Option<Instant> {
+    let state = &env.framework_state.uikit.ui_touch;
+    let now = Instant::now();
+    let drawing = state
+        .last_present
+        .is_some_and(|t| now.duration_since(t) < TAP_HOLD_MAX);
+    if !drawing {
+        return None;
+    }
+    map.keys()
+        .filter_map(|finger| state.down_at.get(finger))
+        .filter(|&&(frame, at)| {
+            frame == state.frames_presented && now.duration_since(at) < TAP_HOLD_MAX
+        })
+        .map(|&(_, at)| at + TAP_HOLD_MAX)
+        .min()
 }
 
 pub(super) struct UITouchHostObject {
@@ -123,7 +159,14 @@ pub fn handle_event(env: &mut Environment, event: Event) {
                 _ => unreachable!(),
             };
             for (finger, coords) in map {
-                log!("n72 touch {} {:?} at {:.0}, {:.0}", kind, finger, coords.0, coords.1);
+                log!(
+                    "n72 touch {} {:?} at {:.0}, {:.0}, frame {}",
+                    kind,
+                    finger,
+                    coords.0,
+                    coords.1,
+                    env.framework_state.uikit.ui_touch.frames_presented
+                );
             }
         }
     }
@@ -131,6 +174,26 @@ pub fn handle_event(env: &mut Environment, event: Event) {
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
     for &touch in (*current_touches).values() {
         env.objc.borrow_mut::<UITouchHostObject>(touch).phase = UITouchPhaseStationary;
+    }
+    {
+        let state = &mut env.framework_state.uikit.ui_touch;
+        let frame = state.frames_presented;
+        match &event {
+            Event::TouchesDown(map) => {
+                for &finger in map.keys() {
+                    state
+                        .down_at
+                        .entry(finger)
+                        .or_insert((frame, Instant::now()));
+                }
+            }
+            Event::TouchesUp(map) => {
+                for finger in map.keys() {
+                    state.down_at.remove(finger);
+                }
+            }
+            _ => (),
+        }
     }
     match event {
         Event::TouchesDown(map) => handle_touches_down(env, map),
