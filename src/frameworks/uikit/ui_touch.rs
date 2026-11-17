@@ -32,9 +32,38 @@ pub struct State {
     /// presentRenderbuffer), and when it last did.
     pub frames_presented: u64,
     pub last_present: Option<Instant>,
-    /// n72 fork: for each finger down, the frame count and time when the app
-    /// got its touchesBegan.
-    down_at: HashMap<FingerId, (u64, Instant)>,
+    /// n72 fork: each finger down: see [FingerDown].
+    down_at: HashMap<FingerId, FingerDown>,
+}
+
+/// n72 fork: a finger the app got a touchesBegan for.
+struct FingerDown {
+    /// the frame count and time then
+    frame: u64,
+    at: Instant,
+    /// where it went down, and whether it has left the slop circle around it
+    coords: Coords,
+    moved: bool,
+}
+
+/// n72 fork: how far a finger must move from where it went down before the
+/// app hears of any movement (points; N72_TOUCH_SLOP overrides it). The
+/// N72's panel reports a tap as 1.5 to 4.5 points of movement, mostly as the
+/// finger lifts and the contact shrinks (measured in Spore, 2026-11-18).
+/// Spore takes that movement as a scroll, though taps work on a real iPod,
+/// so Apple's touch stack shows apps less of it (UIKit itself does pass on
+/// any movement it gets). A tap's up is reported where it went down. The
+/// cost: drags start 8 points late, and smaller slow drags are lost; holding
+/// the position while the contact collapses (where the contact size is
+/// known: the router or the driver) would be narrower.
+fn touch_slop() -> f32 {
+    static SLOP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SLOP.get_or_init(|| {
+        std::env::var("N72_TOUCH_SLOP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8.0)
+    })
 }
 
 /// n72 fork: how long a touch-up may wait for the app to draw a frame with
@@ -58,10 +87,8 @@ pub fn should_hold_up(env: &Environment, map: &HashMap<FingerId, Coords>) -> Opt
     }
     map.keys()
         .filter_map(|finger| state.down_at.get(finger))
-        .filter(|&&(frame, at)| {
-            frame == state.frames_presented && now.duration_since(at) < TAP_HOLD_MAX
-        })
-        .map(|&(_, at)| at + TAP_HOLD_MAX)
+        .filter(|d| d.frame == state.frames_presented && now.duration_since(d.at) < TAP_HOLD_MAX)
+        .map(|d| d.at + TAP_HOLD_MAX)
         .min()
 }
 
@@ -145,7 +172,50 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 /// [super::handle_events] will forward touch events to this function.
-pub fn handle_event(env: &mut Environment, event: Event) {
+pub fn handle_event(env: &mut Environment, mut event: Event) {
+    // n72 fork: the frame a finger went down in, and the touch slop.
+    {
+        let state = &mut env.framework_state.uikit.ui_touch;
+        let frame = state.frames_presented;
+        let slop = touch_slop();
+        match &mut event {
+            Event::TouchesDown(map) => {
+                for (&finger, &coords) in map.iter() {
+                    state.down_at.entry(finger).or_insert(FingerDown {
+                        frame,
+                        at: Instant::now(),
+                        coords,
+                        moved: false,
+                    });
+                }
+            }
+            Event::TouchesMove(map) => {
+                map.retain(|finger, coords| {
+                    let Some(d) = state.down_at.get_mut(finger) else {
+                        return true;
+                    };
+                    if !d.moved {
+                        let (dx, dy) = (coords.0 - d.coords.0, coords.1 - d.coords.1);
+                        d.moved = dx * dx + dy * dy > slop * slop;
+                    }
+                    d.moved
+                });
+                if map.is_empty() {
+                    return;
+                }
+            }
+            Event::TouchesUp(map) => {
+                for (finger, coords) in map.iter_mut() {
+                    if let Some(d) = state.down_at.remove(finger) {
+                        if !d.moved {
+                            *coords = d.coords;
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
     // n72 fork: N72_LOG_TOUCH=1 logs what reaches the app (a drag must show
     // as one down, moves, one up; a touch screen in multitouch protocol A
     // came through SDL as a down and an up per frame).
@@ -174,26 +244,6 @@ pub fn handle_event(env: &mut Environment, event: Event) {
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
     for &touch in (*current_touches).values() {
         env.objc.borrow_mut::<UITouchHostObject>(touch).phase = UITouchPhaseStationary;
-    }
-    {
-        let state = &mut env.framework_state.uikit.ui_touch;
-        let frame = state.frames_presented;
-        match &event {
-            Event::TouchesDown(map) => {
-                for &finger in map.keys() {
-                    state
-                        .down_at
-                        .entry(finger)
-                        .or_insert((frame, Instant::now()));
-                }
-            }
-            Event::TouchesUp(map) => {
-                for finger in map.keys() {
-                    state.down_at.remove(finger);
-                }
-            }
-            _ => (),
-        }
     }
     match event {
         Event::TouchesDown(map) => handle_touches_down(env, map),
