@@ -1,0 +1,10 @@
+#!/bin/sh
+# The linker for n72/pgo/build.sh: n72/armhf-cc, except that the crate's cdylib (used only on Android)
+# is written in spite of relocation errors. With profile counters every function stays alive in it, and
+# code built for a static, non-PIE executable (local-exec TLS, absolute addresses) cannot go into a
+# shared object; nothing loads that file.
+H=$(cd "$(dirname "$0")/.." && pwd)
+for a in "$@"; do
+	[ "$a" = -shared ] && exec "$H/armhf-cc" "$@" -Wl,--noinhibit-exec 2>/dev/null
+done
+exec "$H/armhf-cc" "$@"

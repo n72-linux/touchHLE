@@ -53,7 +53,8 @@ fn main() {
         // link). Alpine's own libopenal is built -Os with libstdc++'s
         // assertions on, which leaves a bounds-checked call per sample in
         // the mixer's and the resamplers' inner loops; this build takes the
-        // profile's optimisation level.
+        // profile's optimisation level (CMake's Release type would make it
+        // -O3 whatever the profile says).
         let n72 = os.eq_ignore_ascii_case("linux")
             && env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "arm");
         if n72 {
@@ -87,6 +88,11 @@ fn main() {
             build.define("ALSOFT_INSTALL_HRTF_DATA", "OFF");
             build.define("ALSOFT_INSTALL_AMBDEC_PRESETS", "OFF");
             build.define("ALSOFT_UPDATE_BUILD_VERSION", "OFF");
+            if let Ok(level) = env::var("OPT_LEVEL") {
+                let flags = format!("-O{level} -DNDEBUG");
+                build.define("CMAKE_C_FLAGS_RELEASE", &flags);
+                build.define("CMAKE_CXX_FLAGS_RELEASE", &flags);
+            }
         }
 
         let openal_soft_out = build.build();

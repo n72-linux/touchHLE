@@ -279,6 +279,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let fullscreen_layer = find_fullscreen_eagl_layer(env);
+    // n72 fork: a build instrumented for a profile (n72/pgo/README) writes
+    // its counters every 256 frames; test runs end with a kill.
+    #[cfg(n72_pgo_gen)]
+    {
+        extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 255 {
+            unsafe { __llvm_profile_write_file() };
+        }
+    }
     if crate::dyld::n72_svc_stats_on() {
         static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

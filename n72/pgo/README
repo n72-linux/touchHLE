@@ -1,0 +1,77 @@
+Profile-guided and link-time optimised builds of the n72 binary
+================================================================
+
+build.sh VARIANT builds touchHLE for the iPod touch 2G one of several ways,
+each in its own target directory, target/n72-var/VARIANT:
+
+  base    -O3, no LTO, no profile (how n72/env.sh's command builds it)
+  gen     instrumented for a profile: the Rust code and OpenAL Soft, -O2
+  o3pgo   -O3 with touchHLE.profdata
+  o2lto   -O2, LTO, profile
+  o3lto   -O3, LTO, profile
+
+LTO means the Rust crates optimised as one unit (lto = "fat", one codegen
+unit) and OpenAL Soft's objects optimised together at link time
+(-flto, lld at the same level). OpenAL Soft follows the cargo profile's
+optimisation level (its build.rs sets CMake's Release flags from OPT_LEVEL;
+before, CMake's Release type made it -O3 whatever the profile said).
+
+The profile runtime
+-------------------
+
+rustc 1.99 and Homebrew's clang are LLVM 23 and write raw profile format 11;
+Alpine 3.24's compiler-rt (LLVM 22) has format 10, and rustup ships no
+profiler_builtins for arm-unknown-linux-musleabihf. So the runtime is built
+from compiler-rt's lib/profile of LLVM 23.1.1:
+alpine-work/src/compiler-rt-23/build.sh -> libclang_rt.profile-armhf.a.
+build.sh gen links it into the Rust side (-Z no-profiler-runtime under
+RUSTC_BOOTSTRAP, which is why the gen build needs it) and gives clang a
+copy of its resource directory with the runtime in it, so that CMake's
+compiler checks for OpenAL Soft link.
+
+The instrumented binary writes its counters every 256 frames
+(cfg n72_pgo_gen in EAGLContext's presentRenderbuffer), since test runs end
+with a kill:
+
+  LLVM_PROFILE_FILE=/root/n72hle-test/pgo/th-%p.profraw ./touchHLE.gen ...
+  llvm-profdata merge -o n72/pgo/touchHLE.profdata th-*.profraw
+
+link-cc is the linker for these builds: the crate's cdylib (only Android
+uses it) cannot be linked from code built for a static non-PIE executable
+once profile counters keep every function in it, and is written anyway;
+nothing loads it.
+
+Checking output
+---------------
+
+altest.c renders six sources (sweep, noise, square, stereo chord; moving,
+pitched, stopped and restarted) through an OpenAL loopback device with
+n72/alsoft.conf and prints a checksum per second; altest.sh VARIANT links it
+against that variant's OpenAL Soft. Run under qemu-arm -cpu arm1176 or on
+the device: every variant must print the same checksums.
+
+Results (2026-11-17, iPod on kernel #61, musl r50)
+--------------------------------------------------
+
+Profile: one Spore run of the gen build (start, menus, about a minute of
+play, null OpenAL output), 21 MB raw. Hottest: OpenAL Soft's Mix_ and
+DeviceBase::renderSamples, the cubic resampler, then touchHLE's guest
+memory accessors and call path.
+
+Output: altest prints the same checksums for all builds, under qemu and on
+the device (20 s, every sample).
+
+Spore, ms/frame over windows of 200 frames (N72_SVC_STATS, N72_FIXED_SEED,
+ALSOFT_DRIVERS=null; the game is GPU-bound at 20 FPS throughout):
+
+  build                main thread          mixer thread  runs
+  base (-O3)           26.33                3.93          1
+  o3pgo                26.70                3.93          1
+  o2lto                26.40, 26.45 (part)  3.88          2
+  o3lto                26.18, 26.23         3.85          2
+
+The differences are within run-to-run noise (about 0.5 ms): no build is
+worth installing. The iPod reset about 75 s into the second o2lto run (it
+came back in iOS; no panic, no crumb, battery 95 % on USB). One event does
+not pin it on that build, and the second base and o3pgo runs never ran.
+altest's wall time on the device was not measured (busybox date has no %N).
