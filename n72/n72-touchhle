@@ -1,0 +1,10 @@
+#!/bin/sh
+# n72-touchhle APP: an iPhone OS app (.app or .ipa) in the native touchHLE
+# fork, as the launcher starts it. Log: /root/n72hle-test/<app>.log
+# Installed as /usr/bin/n72-touchhle (by hand; no package owns it).
+# --print-fps writes the frame rate to the log once a second.
+cd /root/n72hle-test || exit 1
+log=/root/n72hle-test/$(basename "${1%.*}").log
+echo "=== start $(date) $1" >> "$log"
+N72_GLES_VGP=1 SDL_VIDEODRIVER=kmsdrm RUST_BACKTRACE=1 ./touchHLE "$1" --print-fps >> "$log" 2>&1
+echo "=== exit $? $(date)" >> "$log"
