@@ -49,20 +49,21 @@ struct FingerDown {
 /// n72 fork: how far a finger must move from where it went down before the
 /// app hears of any movement (points; N72_TOUCH_SLOP overrides it). The
 /// N72's panel reports a tap as 1.5 to 4.5 points of movement, mostly as the
-/// finger lifts and the contact shrinks (measured in Spore, 2026-11-18).
+/// finger lifts and the contact shrinks (measured in Spore).
 /// Spore takes that movement as a scroll, though taps work on a real iPod,
-/// so Apple's touch stack shows apps less of it (UIKit itself does pass on
+/// so the OS touch stack shows apps less of it (UIKit itself passes on
 /// any movement it gets). A tap's up is reported where it went down. The
-/// cost: drags start 8 points late, and smaller slow drags are lost; holding
-/// the position while the contact collapses (where the contact size is
-/// known: the router or the driver) would be narrower.
+/// cost: drags start that late, and smaller slow drags are lost. n72-ui's
+/// touch router (a22d60b) holds the position while a resting contact
+/// collapses at lift-off; through it the recorded taps move 0.1 to 1.8
+/// points, so 3 points is enough (8 without that router).
 fn touch_slop() -> f32 {
     static SLOP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *SLOP.get_or_init(|| {
         std::env::var("N72_TOUCH_SLOP")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8.0)
+            .unwrap_or(3.0)
     })
 }
 
@@ -216,6 +217,7 @@ pub fn handle_event(env: &mut Environment, mut event: Event) {
             _ => (),
         }
     }
+    #[cfg(feature = "n72-prof")]
     // n72 fork: N72_LOG_TOUCH=1 logs what reaches the app (a drag must show
     // as one down, moves, one up; a touch screen in multitouch protocol A
     // came through SDL as a down and an up per frame).
