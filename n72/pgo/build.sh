@@ -2,6 +2,7 @@
 # n72/pgo/build.sh VARIANT: the n72 binary built one of several ways, each in its own target
 # directory (target/n72-var/VARIANT/.../touchHLE); see n72/pgo/README.
 #   base     -O3, no LTO, no profile (as the installed builds so far)
+#   o2       -O2, no LTO, no profile (the norm: n72-alpine/BUILD-FLAGS.md)
 #   gen      instrumented for a profile (Rust and OpenAL Soft), -O2
 #   o3pgo    -O3 with n72/pgo/touchHLE.profdata
 #   o2lto    -O2, LTO, profile        o3lto    -O3, LTO, profile
@@ -20,6 +21,7 @@ CF=; LTO=false; CGU=16; OPT=3
 NOWARN="-Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
 case $V in
 base) ;;
+o2)	OPT=2 ;;
 gen)	OPT=2
 	export RUSTC_BOOTSTRAP=1	# -Z no-profiler-runtime: rustup ships no profiler_builtins for this target
 	R="$R -C profile-generate=/root/n72hle-test/pgo -Z no-profiler-runtime --cfg n72_pgo_gen -C link-arg=-Wl,-u,__llvm_profile_runtime -C link-arg=$RT"
