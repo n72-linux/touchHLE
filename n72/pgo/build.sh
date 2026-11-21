@@ -1,8 +1,8 @@
 #!/bin/bash
 # n72/pgo/build.sh VARIANT: the n72 binary built one of several ways, each in its own target
 # directory (target/n72-var/VARIANT/.../touchHLE); see n72/pgo/README.
-#   base     -O3, no LTO, no profile (as the installed builds so far)
-#   o2       -O2, no LTO, no profile (the norm: n72-alpine/BUILD-FLAGS.md)
+#   base     -O3, no LTO, no profile (as installed until 2026-11-21)
+#   o2       -O2, no LTO, no profile (the norm: n72-alpine/BUILD-FLAGS.md; n72/env.sh's build since 2026-11-21)
 #   gen      instrumented for a profile (Rust and OpenAL Soft), -O2
 #   o3pgo    -O3 with n72/pgo/touchHLE.profdata
 #   o2lto    -O2, LTO, profile        o3lto    -O3, LTO, profile

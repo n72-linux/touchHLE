@@ -50,8 +50,8 @@ n72/alsoft.conf and prints a checksum per second; altest.sh VARIANT links it
 against that variant's OpenAL Soft. Run under qemu-arm -cpu arm1176 or on
 the device: every variant must print the same checksums.
 
-Results (2026-11-17, iPod on kernel #61, musl r50)
---------------------------------------------------
+Results (iPod on kernel #61, musl r50)
+-------------------------------------
 
 Profile: one Spore run of the gen build (start, menus, about a minute of
 play, null OpenAL output), 21 MB raw. Hottest: OpenAL Soft's Mix_ and
@@ -75,3 +75,23 @@ worth installing. The iPod reset about 75 s into the second o2lto run (it
 came back in iOS; no panic, no crumb, battery 95 % on USB). One event does
 not pin it on that build, and the second base and o3pgo runs never ran.
 altest's wall time on the device was not measured (busybox date has no %N).
+
+-O2 against -O3 (kernel #70)
+---------------------------
+
+`build.sh o2` (plain -O2, no LTO, no profile) against `build.sh base`
+(-O3). altest: identical checksums under qemu and on the device, 1.78-1.81 s
+for both. Spore (runx.sh, 60 s of play, N72_FIXED_SEED, ALSOFT_DRIVERS=null,
+the save restored before every run), main thread ms/frame:
+
+  run                     base (-O3)    o2
+  n72-ui kept running     19.8-21.0     30.0-35.3
+  n72-ui stopped, 1       29.4-33.0     30.6-32.9
+  n72-ui stopped, 2       30.9-32.5     20.3-20.4
+
+The main thread sits at about 20 or about 31 ms a frame from run to run,
+with either build: a state of the run, not the build (cause unknown). The
+mixer thread 3.8-6 ms on both, the game at 20 FPS throughout. -O3 shows no
+gain, so n72/env.sh builds at -O2 since (CARGO_PROFILE_RELEASE_OPT_LEVEL=2).
+runx.sh with KEEPUI=1 lets n72-ui's idle timer sleep the iPod mid-run (the
+game was not started by n72-ui, so it does not count as played): use 0.

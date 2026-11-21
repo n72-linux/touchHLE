@@ -17,3 +17,6 @@ export CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER="$N72_HLE/n72/armhf-cc"
 # linked at 0x70000000 so the guest arena 0x1000-0x60000000 stays free (ARM
 # Linux loads PIEs at 4 MiB).
 export CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-C target-feature=-crt-static -C relocation-model=static -C link-arg=-no-pie -C link-arg=-Wl,--image-base=0x70000000 -L $N72_SYSROOT/usr/lib"
+# -O2, the norm (n72-alpine/BUILD-FLAGS.md): Spore and altest measured no different at -O3 (2026-11-21,
+# n72/pgo/README). OpenAL Soft follows the profile's level (its build.rs).
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
