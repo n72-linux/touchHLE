@@ -75,8 +75,26 @@ const DIRECT_GL: &[&str] = &[
     "glBindTexture",
     "glEnable",
     "glDisable",
-    "glMaterialfv",
     "glLightfv",
+    // Fixed-point API (Galaxy on Fire: ~600 glLoadMatrixx and as many
+    // glDrawElements per frame, a quad each). With the native CPU backend an
+    // index pointer needs no translation, and the fog clamp in `gles_guest`
+    // works around other drivers' bugs, not n72-gles's (glDrawArrays already
+    // skips it here).
+    "glLoadMatrixx",
+    "glMultMatrixx",
+    "glDrawElements",
+    "glDepthMask",
+    "glColor4x",
+    "glColor4ub",
+    "glShadeModel",
+    "glScalex",
+    "glTranslatex",
+    "glRotatex",
+    "glTexEnvx",
+    "glCullFace",
+    "glDepthFunc",
+    "glFrontFace",
 ];
 
 /// Functions with float arguments: through a soft-float shim below.
@@ -87,6 +105,10 @@ const SHIM_GL: &[&str] = &[
     "glColor4f",
     "glOrthof",
     "glMaterialf",
+    // Not float, but the face needs mapping ([crate::gles::apple_material_face]).
+    "glMaterialfv",
+    "glMaterialx",
+    "glMaterialxv",
 ];
 
 /// Resolve the host GL functions once a GL context exists.
@@ -135,7 +157,38 @@ shims! {
     glTranslatef(x: f32, y: f32, z: f32);
     glScalef(x: f32, y: f32, z: f32);
     glColor4f(r: f32, g: f32, b: f32, a: f32);
-    glMaterialf(face: u32, pname: u32, param: f32);
+}
+
+/// glMaterial*: the face goes through [crate::gles::apple_material_face]
+/// first (GL_FRONT is taken, as on iPhone OS; n72-gles alone would raise
+/// GL_INVALID_ENUM, which stays pending for the app's next glGetError).
+macro_rules! material_shims {
+    ($($name:ident ( $param:ty ) ;)*) => {
+        $(
+            #[allow(non_snake_case)]
+            extern "aapcs" fn $name(face: u32, pname: u32, param: $param) {
+                static F: OnceLock<usize> = OnceLock::new();
+                let f = *F.get_or_init(|| gl(stringify!($name)));
+                let f: extern "C" fn(u32, u32, $param) = unsafe { std::mem::transmute(f) };
+                if let Some(face) = crate::gles::apple_material_face(face) {
+                    f(face, pname, param)
+                }
+            }
+        )*
+        fn material_shim_for(name: &str) -> Option<usize> {
+            match name {
+                $(stringify!($name) => Some($name as usize),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+material_shims! {
+    glMaterialf(f32);
+    glMaterialfv(*const f32);
+    glMaterialx(i32);
+    glMaterialxv(*const i32);
 }
 
 /// glOrthof has six words of arguments: the last two are on the guest's
@@ -186,7 +239,7 @@ fn target(symbol: &str) -> Option<(usize, bool)> {
         return (f != 0).then_some((f, true));
     }
     if SHIM_GL.contains(&name) && gl(name) != 0 {
-        return shim_for(name).map(|f| (f, true));
+        return shim_for(name).or_else(|| material_shim_for(name)).map(|f| (f, true));
     }
     None
 }

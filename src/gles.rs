@@ -123,6 +123,29 @@ impl GLESImplementation {
 
 /// Try to create an OpenGL ES 1.1 context using the configured strategies,
 /// panicking on failure.
+/// n72 fork: the `face` of a `glMaterial*` call as a strict OpenGL ES 1.1
+/// implementation (n72-gles) wants it, or `None` to drop the call.
+///
+/// OpenGL ES 1.1 has one material and only takes `GL_FRONT_AND_BACK`;
+/// anything else is `GL_INVALID_ENUM`. Apps written against Apple's
+/// implementation pass `GL_FRONT` and work there (Galaxy on Fire 1.1.5 sets
+/// its ambient and diffuse material that way at start-up). With a strict
+/// implementation the material is not set, and worse, the error stays
+/// pending: that game checks `glGetError` after `glGenTextures` in its
+/// texture loader and gave up its first texture, the font, so all text was
+/// drawn as plain white quads.
+///
+/// `GL_FRONT` therefore sets the material. `GL_BACK` is dropped without an
+/// error (there is no back material to set); that half is an assumption,
+/// no app has been seen to do it.
+pub fn apple_material_face(face: u32) -> Option<u32> {
+    match face {
+        gles11_raw::FRONT => Some(gles11_raw::FRONT_AND_BACK),
+        gles11_raw::BACK => None,
+        other => Some(other),
+    }
+}
+
 pub fn create_gles1_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
     env.on_parent_stack_in_coroutine(|window, options| {
         create_gles1_ctx_no_parent_stack(window, options)

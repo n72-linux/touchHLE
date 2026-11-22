@@ -296,16 +296,24 @@ impl GLES for GLES1Native<'_> {
         gles11::LightModelxv(pname, params)
     }
     unsafe fn Materialf(&mut self, face: GLenum, pname: GLenum, param: GLfloat) {
-        gles11::Materialf(face, pname, param)
+        if let Some(face) = super::apple_material_face(face) {
+            gles11::Materialf(face, pname, param)
+        }
     }
     unsafe fn Materialx(&mut self, face: GLenum, pname: GLenum, param: GLfixed) {
-        gles11::Materialx(face, pname, param)
+        if let Some(face) = super::apple_material_face(face) {
+            gles11::Materialx(face, pname, param)
+        }
     }
     unsafe fn Materialfv(&mut self, face: GLenum, pname: GLenum, params: *const GLfloat) {
-        gles11::Materialfv(face, pname, params)
+        if let Some(face) = super::apple_material_face(face) {
+            gles11::Materialfv(face, pname, params)
+        }
     }
     unsafe fn Materialxv(&mut self, face: GLenum, pname: GLenum, params: *const GLfixed) {
-        gles11::Materialxv(face, pname, params)
+        if let Some(face) = super::apple_material_face(face) {
+            gles11::Materialxv(face, pname, params)
+        }
     }
 
     // Buffers
@@ -456,7 +464,37 @@ impl GLES for GLES1Native<'_> {
         gles11::ReadPixels(x, y, width, height, format, type_, pixels)
     }
     unsafe fn GenTextures(&mut self, n: GLsizei, textures: *mut GLuint) {
-        gles11::GenTextures(n, textures)
+        // n72 fork: the lowest free names, as iPhone OS (and desktop OpenGL
+        // implementations) hand them out. n72-gles counts upwards and never
+        // gives a deleted name again, which the specification allows, but
+        // apps depend on the reuse: Galaxy on Fire 1.1.5 deletes all its
+        // textures between the first screen and the main menu and loads
+        // them again in the same order, while its font keeps the texture
+        // name it was created with. With new names the font's name had no
+        // image any more and every glyph was a white quad.
+        //
+        // A name is taken once a texture object exists for it (n72-gles
+        // creates one at the first bind, and an unknown name is as good to
+        // it as one it generated), so each new name is bound once here:
+        // that keeps it away from the next call, and from n72-gles's own
+        // counter, which touchHLE's internal textures also come through.
+        if n <= 0 {
+            return gles11::GenTextures(n, textures);
+        }
+        let mut bound: GLint = 0;
+        gles11::GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut bound);
+        let mut name: GLuint = 0;
+        for i in 0..n as usize {
+            loop {
+                name += 1;
+                if gles11::IsTexture(name) == 0 {
+                    break;
+                }
+            }
+            gles11::BindTexture(gles11::TEXTURE_2D, name);
+            textures.add(i).write_unaligned(name);
+        }
+        gles11::BindTexture(gles11::TEXTURE_2D, bound as GLuint);
     }
     unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint) {
         gles11::DeleteTextures(n, textures)
