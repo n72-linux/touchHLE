@@ -5,6 +5,10 @@
 # --print-fps writes the frame rate to the log once a second.
 cd /root/n72hle-test || exit 1
 log=/root/n72hle-test/$(basename "${1%.*}").log
-echo "=== start $(date) $1" >> "$log"
-N72_GLES_VGP=1 SDL_VIDEODRIVER=kmsdrm RUST_BACKTRACE=1 ./touchHLE "$1" --print-fps >> "$log" 2>&1
+# Optional per-app environment (debug switches for one game), sourced if it
+# exists: /root/n72hle-test/<app>.env with "export NAME=value" lines.
+env=/root/n72hle-test/$(basename "${1%.*}").env
+[ -f "$env" ] && . "$env"
+echo "=== start $(date) $1${N72_ENV_NOTE:+ [$N72_ENV_NOTE]}" >> "$log"
+SDL_VIDEODRIVER=kmsdrm RUST_BACKTRACE=1 ./touchHLE "$1" --print-fps >> "$log" 2>&1
 echo "=== exit $? $(date)" >> "$log"
