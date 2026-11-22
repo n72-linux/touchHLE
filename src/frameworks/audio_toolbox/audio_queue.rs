@@ -72,6 +72,10 @@ struct AudioQueueHostObject {
     aq_is_running_proc: Option<AudioQueuePropertyListenerProc>,
     aq_is_running_user_data: Option<MutVoidPtr>,
     is_running_handler: bool,
+    /// n72 fork: `AudioQueueDispose` was called without `inImmediate`: the
+    /// audio already handed to OpenAL plays out, then the queue is disposed
+    /// of ([handle_audio_queue]). The app's callback is not called any more.
+    disposing: bool,
 }
 
 /// Track whether the audio queue is meant to be running, in order to handle
@@ -190,6 +194,7 @@ pub fn AudioQueueNewOutput(
         aq_is_running_proc: None,
         aq_is_running_user_data: None,
         is_running_handler: false,
+        disposing: false,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -809,6 +814,20 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
         // Already running, prevent infinite loop from reentrancy
         return;
     }
+    if host_object.disposing {
+        // n72 fork: a deferred AudioQueueDispose: wait for OpenAL to run
+        // out of the audio it was given, then finish.
+        let mut al_source_state = 0;
+        unsafe {
+            context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
+            assert!(context.GetError() == 0);
+        }
+        if al_source_state != al::AL_PLAYING {
+            log_dbg!("OpenAL source done for queue {:?}, disposing of it.", in_aq);
+            dispose_audio_queue(env, in_aq);
+        }
+        return;
+    }
 
     host_object.is_running_handler = true;
 
@@ -1104,8 +1123,41 @@ pub fn AudioQueueDispose(
 ) -> OSStatus {
     return_if_null!(in_aq);
 
-    assert!(in_immediate); // TODO
+    if !in_immediate {
+        // n72 fork: "disposal takes place after all enqueued buffers have
+        // been processed" and the call returns at once. Galaxy on Fire
+        // 1.1.5 ends its menu music this way when a game starts (upstream
+        // asserts here). The queue stays alive, without callbacks to the
+        // app, while its OpenAL source still plays what it was given; the
+        // run loop's next visits finish the job.
+        let (state, context) =
+            State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
+        let host_object = state.audio_queues.get_mut(&in_aq).unwrap();
+        // (Called from the queue's own callback: deferred in any case, the
+        // handler that called it still works on the queue.)
+        let playing = host_object.is_running_handler
+            || host_object.is_running != AudioQueueIsRunning::Stopped
+                && host_object.al_source.is_some_and(|al_source| {
+                let mut al_source_state = 0;
+                unsafe {
+                    context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
+                    assert!(context.GetError() == 0);
+                }
+                    al_source_state == al::AL_PLAYING
+                });
+        if playing {
+            log_dbg!("Deferring disposal of audio queue {:?}", in_aq);
+            host_object.disposing = true;
+            return 0; // success
+        }
+    }
+    dispose_audio_queue(env, in_aq);
+    0 // success
+}
 
+/// The disposal itself: at once for `AudioQueueDispose` with `inImmediate`,
+/// from [handle_audio_queue] once the audio has played out otherwise.
+fn dispose_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     let (state, context) =
         State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
 
@@ -1140,8 +1192,6 @@ pub fn AudioQueueDispose(
     }
 
     ns_run_loop::remove_audio_queue(env, host_object.run_loop, in_aq);
-
-    0 // success
 }
 
 pub const FUNCTIONS: FunctionExports = &[
