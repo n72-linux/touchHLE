@@ -1,0 +1,23 @@
+#!/bin/sh
+# The linker for the gcc build (n72/env.sh, N72_CC=gcc): the cross gcc, except for the crate's
+# cdylib (libtouchHLE.so, used only on Android; nothing loads that file here). Its objects are
+# built for a static, non-PIE executable, which cannot go into a shared object, and gcc's driver
+# lets the -no-pie of our RUSTFLAGS win over -shared (it then links crt1.o and wants main). So for
+# -shared the executable-only arguments are dropped and the file is written in spite of the
+# relocation errors, as n72/pgo/link-cc does for clang; if even that fails an empty file stands in.
+GCC=${N72_TC:?source n72/env.sh}/bin/armv6-alpine-linux-musleabihf-gcc
+shared=
+for a in "$@"; do [ "$a" = -shared ] && shared=1; done
+[ -n "$shared" ] || exec "$GCC" "$@"
+out=
+n=$#
+while [ $n -gt 0 ]; do
+	a=$1; shift; n=$((n - 1))
+	case $a in
+	-no-pie|-Wl,--image-base=*) continue ;;
+	-o) out=$1 ;;
+	esac
+	set -- "$@" "$a"
+done
+"$GCC" "$@" -Wl,--noinhibit-exec 2>/dev/null || { [ -n "$out" ] && : > "$out"; }
+exit 0

@@ -1,8 +1,8 @@
 #!/bin/bash
 # n72/pgo/build.sh VARIANT: the n72 binary built one of several ways, each in its own target
 # directory (target/n72-var/VARIANT/.../touchHLE); see n72/pgo/README.
-#   base     -O3, no LTO, no profile (as installed until 2026-11-21)
-#   o2       -O2, no LTO, no profile (the norm: n72-alpine/BUILD-FLAGS.md; n72/env.sh's build since 2026-11-21)
+#   base     -O3, no LTO, no profile
+#   o2       -O2, no LTO, no profile (the norm: n72-alpine/BUILD-FLAGS.md; n72/env.sh default)
 #   gen      instrumented for a profile (Rust and OpenAL Soft), -O2
 #   o3pgo    -O3 with n72/pgo/touchHLE.profdata
 #   o2lto    -O2, LTO, profile        o3lto    -O3, LTO, profile
@@ -11,6 +11,10 @@
 set -e
 V=${1:?variant}
 H=$(cd "$(dirname "$0")/../.." && pwd)
+# The profile is LLVM's and the LTO is lld's: these variants are clang builds
+# (N72_CC=gcc base|o2 for those two with the cross gcc: n72/env.sh).
+case $V in base|o2) N72_CC=${N72_CC:-clang} ;; *) N72_CC=clang ;; esac
+export N72_CC
 . "$H/n72/env.sh"
 RT=$H/../alpine-work/src/compiler-rt-23/build/libclang_rt.profile-armhf.a
 PROF=$H/n72/pgo/touchHLE.profdata
