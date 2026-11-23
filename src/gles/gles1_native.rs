@@ -81,6 +81,24 @@ pub struct GLES1Native<'gl_ctx> {
     _gl_lifetime: PhantomData<&'gl_ctx ()>,
 }
 
+fn host_supports_pvrtc() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| unsafe {
+        let ext = gles11::GetString(gles11::EXTENSIONS);
+        if ext.is_null() {
+            return false;
+        }
+        let ok = CStr::from_ptr(ext as *const _)
+            .to_string_lossy()
+            .split_whitespace()
+            .any(|e| e == "GL_IMG_texture_compression_pvrtc");
+        if ok {
+            log!("n72: using hardware PVRTC textures (GL_IMG_texture_compression_pvrtc)");
+        }
+        ok
+    })
+}
+
 impl GLES for GLES1Native<'_> {
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gles11::GetString(gles11::VERSION) as *const _);
@@ -464,37 +482,10 @@ impl GLES for GLES1Native<'_> {
         gles11::ReadPixels(x, y, width, height, format, type_, pixels)
     }
     unsafe fn GenTextures(&mut self, n: GLsizei, textures: *mut GLuint) {
-        // n72 fork: the lowest free names, as iPhone OS (and desktop OpenGL
-        // implementations) hand them out. n72-gles counts upwards and never
-        // gives a deleted name again, which the specification allows, but
-        // apps depend on the reuse: Galaxy on Fire 1.1.5 deletes all its
-        // textures between the first screen and the main menu and loads
-        // them again in the same order, while its font keeps the texture
-        // name it was created with. With new names the font's name had no
-        // image any more and every glyph was a white quad.
-        //
-        // A name is taken once a texture object exists for it (n72-gles
-        // creates one at the first bind, and an unknown name is as good to
-        // it as one it generated), so each new name is bound once here:
-        // that keeps it away from the next call, and from n72-gles's own
-        // counter, which touchHLE's internal textures also come through.
-        if n <= 0 {
-            return gles11::GenTextures(n, textures);
-        }
-        let mut bound: GLint = 0;
-        gles11::GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut bound);
-        let mut name: GLuint = 0;
-        for i in 0..n as usize {
-            loop {
-                name += 1;
-                if gles11::IsTexture(name) == 0 {
-                    break;
-                }
-            }
-            gles11::BindTexture(gles11::TEXTURE_2D, name);
-            textures.add(i).write_unaligned(name);
-        }
-        gles11::BindTexture(gles11::TEXTURE_2D, bound as GLuint);
+        // The lowest free names, which apps depend on (Galaxy on Fire 1.1.5
+        // reloads its textures in the same order and its font keeps the
+        // name it was created with), come from n72-gles itself.
+        gles11::GenTextures(n, textures)
     }
     unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint) {
         gles11::DeleteTextures(n, textures)
@@ -587,10 +578,50 @@ impl GLES for GLES1Native<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
+        let is_pvrtc = matches!(
+            internalformat,
+            gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+                | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+                | gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+                | gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+        );
+        if is_pvrtc && host_supports_pvrtc() {
+            let is_2bit = matches!(
+                internalformat,
+                gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG | gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+            );
+            let pot = width > 0
+                && height > 0
+                && (width as u32).is_power_of_two()
+                && (height as u32).is_power_of_two();
+            let bw = ((width as u32) >> if is_2bit { 3 } else { 2 }).max(2);
+            let bh = ((height as u32) >> 2).max(2);
+            let expected = (bw * bh * 8) as GLsizei;
+            if border == 0 && pot && (level > 0 || (width >= 8 && height >= 8)) && image_size == expected {
+                log_dbg!(
+                    "Hardware PVRTC upload: fmt={:#x} level={} {}x{} ({} bytes)",
+                    internalformat,
+                    level,
+                    width,
+                    height,
+                    image_size
+                );
+                gles11::CompressedTexImage2D(
+                    target,
+                    level,
+                    internalformat,
+                    width,
+                    height,
+                    border,
+                    image_size,
+                    data,
+                );
+                return;
+            }
+        }
+
         let data = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize) };
-        // IMG_texture_compression_pvrtc (only on Imagination/Apple GPUs)
-        // TODO: It would be more efficient to use hardware decoding where
-        // available (I just don't have a suitable device to try this on)
+        // IMG_texture_compression_pvrtc (fallback when host lacks hardware PVRTC)
         if try_decode_pvrtc(
             self,
             target,
