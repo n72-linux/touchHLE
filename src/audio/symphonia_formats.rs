@@ -1993,6 +1993,39 @@ mod tests {
         );
     }
 
+    /// CAF files (afconvert on macOS): AAC and ALAC reach the AMC too.
+    #[test]
+    fn caf_kinds() {
+        let dir = std::env::temp_dir().join(format!("touchhle-audio-caf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("in.wav");
+        write_wav(&wav, 44100, 2, 44100 * 2);
+        for format in ["aac", "alac"] {
+            let caf = dir.join(format!("{format}.caf"));
+            let args = [
+                "-f",
+                "caff",
+                "-d",
+                format,
+                wav.to_str().unwrap(),
+                caf.to_str().unwrap(),
+            ];
+            let Some(b) = encode("afconvert", &args, &caf) else {
+                continue;
+            };
+            let data = SharedBytes(Arc::new(b.clone()));
+            let (_, _, params) = open_reader(&data).unwrap();
+            let kind = Kind::of(&params);
+            assert!(
+                matches!(kind, Kind::Aac { amc: true } | Kind::Alac { amc: true, .. }),
+                "{format}: {kind:?}"
+            );
+            let pcm = decode_symphonia_to_pcm(b).unwrap();
+            assert!(pcm.byte_count() > 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// HE-AAC (afconvert on macOS): the length at the SBR rate, 2048 frames
     /// per packet; in software the AAC-LC core, upsampled.
     #[test]
