@@ -148,6 +148,7 @@ impl Shared {
     }
 
     /// Whether everything up to stream position `end` will be dropped.
+    #[cfg(all(target_os = "linux", target_arch = "arm"))]
     fn dropped_below(&self, end: usize) -> bool {
         let st = self.lock();
         end <= st.base.max(self.keep_from(&st))
@@ -319,6 +320,20 @@ fn packet_frames(packet: &Packet, is_mp3: bool) -> u64 {
     } else {
         packet.dur.get()
     }
+}
+
+/// An untrimmed decoder's output for a packet (the AMC's), trimmed as
+/// symphonia's gapless MP3 decoder does: `trim_end` frames off the end
+/// first, then `trim_start` off the start.
+#[cfg_attr(
+    not(any(test, all(target_os = "linux", target_arch = "arm"))),
+    allow(dead_code)
+)]
+fn trim_like_symphonia<'a>(pcm: &'a [u8], packet: &Packet, frame_bytes: usize) -> &'a [u8] {
+    let block = (pcm.len() / frame_bytes) as u64;
+    let end = block.saturating_sub(packet.trim_end.get());
+    let start = packet.trim_start.get().min(end);
+    &pcm[start as usize * frame_bytes..end as usize * frame_bytes]
 }
 
 fn make_decoder(params: &AudioCodecParameters) -> Result<Box<dyn AudioDecoder>, ()> {
@@ -798,12 +813,8 @@ impl Decode {
             let last = next.is_none();
             let r = amc.decode(&input, &sizes, &mut out[..packet_bytes * batch.len()], last);
             for (i, packet) in batch.drain(..r.packets_done).enumerate() {
-                // The AMC's frame is untrimmed: trim it as symphonia's
-                // decoder would (end first, then start).
-                let end = fpp.saturating_sub(packet.trim_end.get());
-                let start = packet.trim_start.get().min(end);
                 let pcm = &out[i * packet_bytes..][..packet_bytes];
-                let pcm = &pcm[start as usize * frame_bytes..end as usize * frame_bytes];
+                let pcm = trim_like_symphonia(pcm, &packet, frame_bytes);
                 let frames = packet_frames(&packet, true);
                 self.shared.push(pcm, frames);
                 pos += frames as usize * frame_bytes;
@@ -874,6 +885,37 @@ mod tests {
         out
     }
 
+    /// The AMC path's layout: untrimmed frames (as the AMC gives them, here
+    /// from symphonia without gapless) trimmed by [trim_like_symphonia] must
+    /// be the gapless decode, packet for packet.
+    fn check_amc_layout(bytes: Vec<u8>, reference: &[u8]) {
+        let data = SharedBytes(Arc::new(bytes));
+        let (mut reader, track_id, params) = open_reader(&data).unwrap();
+        let opts = symphonia::core::codecs::audio::AudioDecoderOptions::default().gapless(false);
+        let mut decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(&params, &opts)
+            .unwrap();
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(packet) = next_packet(&mut *reader, track_id).unwrap() {
+            let decoded = decoder.decode(&packet).unwrap();
+            let frame_bytes = decoded.spec().channels().count() * 2;
+            buf.clear();
+            decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut buf);
+            assert_eq!(
+                (buf.len() / frame_bytes) as u64,
+                mpeg_frame_block(&packet.data).unwrap()
+            );
+            let trimmed = trim_like_symphonia(&buf, &packet, frame_bytes);
+            assert_eq!(
+                trimmed.len() as u64,
+                packet_frames(&packet, true) * frame_bytes as u64
+            );
+            out.extend_from_slice(trimmed);
+        }
+        assert!(out == reference);
+    }
+
     fn write_wav(path: &Path, rate: u32, channels: u16, frames: u32) {
         let spec = hound::WavSpec {
             channels,
@@ -902,6 +944,10 @@ mod tests {
 
     fn check(bytes: Vec<u8>, exact_length: bool) {
         let reference = decode_whole(bytes.clone());
+        let bytes_again = bytes.clone();
+        if exact_length {
+            check_amc_layout(bytes.clone(), &reference);
+        }
         let pcm = decode_symphonia_to_pcm(bytes).unwrap();
         let len = pcm.byte_count() as usize;
         if exact_length {
@@ -966,6 +1012,15 @@ mod tests {
                 assert!(diff <= tolerance, "at {offset}: max diff {diff}");
             }
         }
+        // All of it in one read (system sounds), after the jumps and fresh.
+        let mut all = vec![0u8; len];
+        assert_eq!(pcm.read_bytes(0, &mut all), Ok(len));
+        assert!(all == reference[..len]);
+        drop(pcm);
+        let pcm = decode_symphonia_to_pcm(bytes_again).unwrap();
+        let mut all = vec![0u8; len];
+        assert_eq!(pcm.read_bytes(0, &mut all), Ok(len));
+        assert!(all == reference[..len]);
         // Past the end: as before.
         let mut tail = [0u8; 8];
         assert_eq!(pcm.read_bytes(len as u64, &mut tail), Ok(0));
