@@ -1,5 +1,6 @@
 # N72MediaTest steps, run in order, 3 s apart. One per line:
-#   movie FILE   play the bundle file FILE with MPMoviePlayerController
-# (planned: audio FILE   play it with AVAudioPlayer)
+#   movie FILE            play the bundle file FILE with MPMoviePlayerController
+#   audio FILE [SECONDS]  play FILE with AVAudioPlayer (loops once), stop
+#                         after SECONDS (default 8) or when it finishes
 movie Cut1.mov
 movie Cut1.mov

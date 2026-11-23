@@ -89,6 +89,11 @@ __attribute__((objc_root_class))
                                    selector:(SEL)sel
                                    userInfo:(id)info
                                     repeats:(BOOL)repeats;
+- (void)invalidate;
+@end
+
+@interface NSError : NSObject
+- (NSInteger)code;
 @end
 
 void NSLog(NSString *format, ...);
@@ -123,6 +128,17 @@ extern NSString *const MPMoviePlayerPlaybackDidFinishNotification;
 @interface MPMoviePlayerController : NSObject
 - (id)initWithContentURL:(NSURL *)url;
 - (void)play;
+@end
+
+/* AVFoundation */
+@interface AVAudioPlayer : NSObject
+- (id)initWithContentsOfURL:(NSURL *)url error:(NSError **)error;
+- (void)setDelegate:(id)delegate;
+- (void)setNumberOfLoops:(NSInteger)loops;
+- (NSTimeInterval)duration;
+- (BOOL)isPlaying;
+- (BOOL)play;
+- (void)stop;
 @end
 
 #endif

@@ -6,10 +6,12 @@
  * test.txt one after another, 3 s apart, and logs every step with NSLog
  * (prefix "N72MediaTest:"). Step format, one per line:
  *
- *   movie FILE     MPMoviePlayerController on the bundle file FILE
- *   # comment      (and empty lines) ignored
+ *   movie FILE            MPMoviePlayerController on the bundle file FILE
+ *   audio FILE [SECONDS]  AVAudioPlayer on FILE, numberOfLoops 1, stopped
+ *                         after SECONDS (default 8) or when it finishes
+ *   # comment             (and empty lines) ignored
  *
- * New actions (e.g. "audio FILE" for AVAudioPlayer) go into run_step().
+ * New actions go into runNextStep:.
  * Window colours: green = before the first step, blue = a step finished,
  * red = a step failed (file missing, unknown action).
  *
@@ -30,6 +32,41 @@ static int step_next;
 static UIWindow *window;
 static MPMoviePlayerController *player;
 static CFAbsoluteTime play_start;
+
+#define AUDIO_DEFAULT_SECONDS 8.0
+#define AUDIO_POLL 0.25 /* seconds */
+
+static AVAudioPlayer *audio;
+static NSTimer *audio_poll;
+static double audio_limit;
+static BOOL audio_was_playing;
+
+/* "FILE [SECONDS]": split off a trailing number, if there is one. */
+static double take_seconds(char *file, double dflt) {
+  char *p = file + strlen(file), *num;
+  double v = 0, scale = 0;
+
+  while (p > file && p[-1] != ' ' && p[-1] != '\t')
+    p--;
+  if (p == file || *p == 0)
+    return dflt;
+  for (num = p; *num; num++) {
+    if (*num == '.' && scale == 0)
+      scale = 1;
+    else if (*num >= '0' && *num <= '9') {
+      v = v * 10 + (*num - '0');
+      if (scale != 0)
+        scale *= 10;
+    } else
+      return dflt; /* not a number: part of the file name */
+  }
+  if (scale != 0)
+    v /= scale;
+  while (p > file && (p[-1] == ' ' || p[-1] == '\t'))
+    p--;
+  *p = 0;
+  return v > 0 ? v : dflt;
+}
 
 /* Split "action file" into the step table; false on a bad line. */
 static BOOL add_step(char *line) {
@@ -104,6 +141,9 @@ static NSString *bundle_file(const char *name) {
 - (void)runNextStep:(NSTimer *)timer;
 - (void)stepDone:(BOOL)ok;
 - (void)movieFinished:(NSNotification *)note;
+- (void)audioPoll:(NSTimer *)timer;
+- (void)audioEnd:(const char *)why;
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)p successfully:(BOOL)ok;
 @end
 
 @implementation N72MediaTestDelegate
@@ -156,7 +196,43 @@ static NSString *bundle_file(const char *name) {
     return; /* movieFinished: goes on */
   }
 
-  /* "audio FILE" (AVAudioPlayer) goes here later. */
+  if (!strcmp(step_action[i], "audio")) {
+    NSError *err = nil;
+    char *file = step_file[i];
+
+    audio_limit = take_seconds(file, AUDIO_DEFAULT_SECONDS);
+    NSLog(@"N72MediaTest: audio %s start", file);
+    path = bundle_file(file);
+    if (path == nil) {
+      NSLog(@"N72MediaTest: audio %s: not in the bundle", file);
+      [self stepDone:NO];
+      return;
+    }
+    audio = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]
+                                                   error:&err];
+    if (audio == nil) {
+      NSLog(@"N72MediaTest: audio %s: cannot open, error code %d", file,
+            err != nil ? [err code] : 0);
+      [self stepDone:NO];
+      return;
+    }
+    [audio setDelegate:self];
+    [audio setNumberOfLoops:1];
+    NSLog(@"N72MediaTest: audio %s duration %.3f s, loops 1, limit %.1f s",
+          file, [audio duration], audio_limit);
+    play_start = CFAbsoluteTimeGetCurrent();
+    if (![audio play])
+      NSLog(@"N72MediaTest: audio %s: play returned NO", file);
+    audio_was_playing = YES;
+    audio_poll =
+        [NSTimer scheduledTimerWithTimeInterval:AUDIO_POLL
+                                         target:self
+                                       selector:@selector(audioPoll:)
+                                       userInfo:nil
+                                        repeats:YES];
+    return; /* audioPoll: or the delegate goes on */
+  }
+
   NSLog(@"N72MediaTest: unknown action %s skipped", step_action[i]);
   [self stepDone:NO];
 }
@@ -180,6 +256,41 @@ static NSString *bundle_file(const char *name) {
   /* no stop: touchHLE drops its own reference once it has posted this */
   [player release];
   player = nil;
+  [self stepDone:YES];
+}
+
+/* Every AUDIO_POLL s: the time limit, and isPlaying for the log. */
+- (void)audioPoll:(NSTimer *)timer {
+  CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - play_start;
+  if (audio == nil)
+    return;
+  if (audio_was_playing && ![audio isPlaying]) {
+    /* the last packets are queued, not yet heard: keep going */
+    audio_was_playing = NO;
+    NSLog(@"N72MediaTest: audio isPlaying NO after %.2f s", elapsed);
+  }
+  if (elapsed >= audio_limit)
+    [self audioEnd:"stopped at the time limit"];
+}
+
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)p successfully:(BOOL)ok {
+  if (p != audio || audio == nil) {
+    NSLog(@"N72MediaTest: audioPlayerDidFinishPlaying for no player of ours");
+    return;
+  }
+  [self audioEnd:ok ? "finished (delegate, successfully YES)"
+                    : "finished (delegate, successfully NO)"];
+}
+
+- (void)audioEnd:(const char *)why {
+  CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - play_start;
+  NSLog(@"N72MediaTest: audio %s after %.2f s", why, elapsed);
+  [audio_poll invalidate]; /* the run loop's reference goes */
+  audio_poll = nil;
+  [audio setDelegate:nil];
+  [audio stop];
+  [audio release];
+  audio = nil;
   [self stepDone:YES];
 }
 

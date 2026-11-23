@@ -29,7 +29,8 @@ docker run --rm -i -v "$here":/src:ro ios-armv6-tc sh -euc '
     -o '$app'/N72MediaTest obj/start.o obj/main.o \
     /src/stubs/libSystem.tbd /src/stubs/libobjc.tbd \
     /src/stubs/CoreFoundation.tbd /src/stubs/Foundation.tbd \
-    /src/stubs/UIKit.tbd /src/stubs/MediaPlayer.tbd
+    /src/stubs/UIKit.tbd /src/stubs/MediaPlayer.tbd \
+    /src/stubs/AVFoundation.tbd
   ldid -S '$app'/N72MediaTest
   cp /src/Info.plist /src/test.txt '$app'/
   printf "APPL????" > '$app'/PkgInfo
