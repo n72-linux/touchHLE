@@ -14,9 +14,10 @@ use crate::frameworks::audio_toolbox::audio_file::{
     AudioFileGetProperty, AudioFileID, AudioFileOpenURL, AudioFileReadPackets,
 };
 use crate::frameworks::audio_toolbox::audio_queue::{
-    kAudioQueueParam_Volume, AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose,
-    AudioQueueEnqueueBuffer, AudioQueueGetParameter, AudioQueueNewOutput, AudioQueueOutputCallback,
-    AudioQueuePause, AudioQueueRef, AudioQueueSetParameter, AudioQueueStart, AudioQueueStop,
+    defer_callback, kAudioQueueParam_Volume, AudioQueueAllocateBuffer, AudioQueueBufferRef,
+    AudioQueueDispose, AudioQueueEnqueueBuffer, AudioQueueGetParameter, AudioQueueNewOutput,
+    AudioQueueOutputCallback, AudioQueuePause, AudioQueueRef, AudioQueueSetParameter,
+    AudioQueueStart, AudioQueueStop,
 };
 use crate::frameworks::carbon_core::eofErr;
 use crate::frameworks::core_audio_types::AudioStreamBasicDescription;
@@ -231,7 +232,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         let status = AudioQueueAllocateBuffer(env, aq_ref, buffer_byte_size, buffers + i as u32);
         assert_eq!(status, 0);
 
-        _touchHLE_AVAudioPlayerOutputBufferHelper(env, this.cast(), aq_ref, env.mem.read(buffers + i as u32));
+        let buffer = env.mem.read(buffers + i as u32);
+        if i == 0 {
+            _touchHLE_AVAudioPlayerOutputBufferHelper(env, this.cast(), aq_ref, buffer);
+        } else {
+            // n72 fork: the others on the run loop's next visit once the
+            // queue runs (well within the first buffer's half second), so
+            // that play does not wait for a second and a half of decoded
+            // audio.
+            defer_callback(env, aq_ref, buffer);
+        }
     }
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).is_playing = false;
 

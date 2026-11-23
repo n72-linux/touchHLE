@@ -85,6 +85,10 @@ struct AudioQueueHostObject {
     /// n72 fork: the OpenAL format and rate of the compressed buffers on the
     /// source since it was last emptied (OpenAL takes no mix on a queue).
     al_format: Option<(ALenum, ALsizei)>,
+    /// n72 fork: buffers handed to the callback on the next visit of the
+    /// run loop while the queue runs, as if they had just played
+    /// ([defer_callback]).
+    deferred_callbacks: Vec<AudioQueueBufferRef>,
 }
 
 /// n72 fork: compressed AudioQueue input, decoded on a thread of its own
@@ -420,6 +424,7 @@ pub fn AudioQueueNewOutput(
         disposing: false,
         decoder: compressed_format(&format).and_then(|f| QueueDecoder::new(f, &format)),
         al_format: None,
+        deferred_callbacks: Vec::new(),
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -1183,6 +1188,20 @@ fn unqueue_buffers<F: FnMut(ALuint)>(al_source: ALuint, context: &OpenAL<'_>, mu
     }
 }
 
+/// n72 fork: hand `buffer` to the queue's callback on the run loop's next
+/// visit while the queue runs, as if it had played. AVAudioPlayer fills its
+/// second and later buffers this way instead of all of them before `play`
+/// returns.
+pub fn defer_callback(env: &mut Environment, in_aq: AudioQueueRef, buffer: AudioQueueBufferRef) {
+    let host_object = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)
+        .unwrap();
+    if host_object.buffers.contains(&buffer) && !host_object.deferred_callbacks.contains(&buffer) {
+        host_object.deferred_callbacks.push(buffer);
+    }
+}
+
 /// For use by `NSRunLoop`: check the status of an audio queue, recycle buffers,
 /// call callbacks, push new buffers etc.
 pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
@@ -1221,6 +1240,12 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     host_object.is_running_handler = true;
 
     let mut buffers_to_reuse = Vec::new();
+
+    // Buffers held back for this (the queue is running now), before the
+    // ones OpenAL has played.
+    if host_object.is_running == AudioQueueIsRunning::Running {
+        buffers_to_reuse.append(&mut host_object.deferred_callbacks);
+    }
 
     unqueue_buffers(al_source, &context, |al_buffer| {
         host_object.al_unused_buffers.push(al_buffer);
