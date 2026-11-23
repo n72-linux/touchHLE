@@ -17,6 +17,7 @@ mod amc;
 mod ima4;
 pub mod openal;
 mod symphonia_formats;
+mod wave;
 
 pub use ima4::decode_ima4;
 
@@ -52,7 +53,7 @@ pub struct AudioDescription {
 
 pub struct AudioFile(AudioFileInner);
 enum AudioFileInner {
-    Wave(hound::WavReader<Cursor<Vec<u8>>>),
+    Wave(wave::WaveFile),
     Symphonia(symphonia_formats::SymphoniaDecodedToPcm),
 }
 
@@ -79,14 +80,10 @@ impl AudioFile {
     }
 
     pub fn read_from_vec(bytes: Vec<u8>) -> Result<Self, AudioFileOpenError> {
-        // WavReader::new() consume the reader (in this case, a Cursor)
-        // passed to it. This is a bit annoying considering we don't know
-        // which is appropriate for the file. This is worked around here by
-        // using temporary readers for checking if the file is the supported
-        // format, then recreating the reader if that works.
         if hound::WavReader::new(Cursor::new(&bytes)).is_ok() {
-            let reader = hound::WavReader::new(Cursor::new(bytes)).unwrap();
-            Ok(AudioFile(AudioFileInner::Wave(reader)))
+            let wave =
+                wave::WaveFile::new(bytes).map_err(|_| AudioFileOpenError::FileDecodeError)?;
+            Ok(AudioFile(AudioFileInner::Wave(wave)))
         // TODO: Real MP3/MP4/Non-linear PCM container handling. Currently we
         // decode the file to PCM (on a background thread, a few seconds
         // around the reads) and act as if it's a PCM file, simply because
@@ -101,13 +98,13 @@ impl AudioFile {
 
     pub fn audio_description(&self) -> AudioDescription {
         match self.0 {
-            AudioFileInner::Wave(ref wave_reader) => {
+            AudioFileInner::Wave(ref wave) => {
                 let hound::WavSpec {
                     channels,
                     sample_rate,
                     bits_per_sample,
                     sample_format,
-                } = wave_reader.spec();
+                } = wave.spec;
                 // Hound supports unsigned 8-bit, signed 16-bit, signed 24-bit
                 // and floating-point 32-bit linear PCM. We should expose all of
                 // these eventually, but we should only expose formats we've
@@ -161,10 +158,7 @@ impl AudioFile {
 
     pub fn byte_count(&self) -> u64 {
         match self.0 {
-            AudioFileInner::Wave(ref wave_reader) => {
-                let sample_count = wave_reader.len(); // position-independent
-                u64::from(sample_count) * self.bytes_per_sample()
-            }
+            AudioFileInner::Wave(ref wave) => u64::from(wave.num_samples) * self.bytes_per_sample(),
             AudioFileInner::Symphonia(ref pcm) => pcm.byte_count(),
         }
     }
@@ -197,44 +191,7 @@ impl AudioFile {
     /// Returns the number of bytes read.
     pub fn read_bytes(&mut self, offset: u64, buffer: &mut [u8]) -> Result<usize, ()> {
         match self.0 {
-            AudioFileInner::Wave(_) => {
-                let bytes_per_sample = self.bytes_per_sample();
-                assert!(offset.is_multiple_of(bytes_per_sample));
-                assert!(u64::try_from(buffer.len())
-                    .unwrap()
-                    .is_multiple_of(bytes_per_sample));
-
-                let sample_count = u64::try_from(buffer.len()).unwrap() / bytes_per_sample;
-                let sample_count: usize = sample_count.try_into().unwrap();
-
-                let AudioFileInner::Wave(ref mut wave_reader) = self.0 else {
-                    unreachable!()
-                };
-
-                let channels: u64 = wave_reader.spec().channels.into();
-                // WavReader expects number of samples which are
-                // independent of the number of channels here
-                wave_reader
-                    .seek((offset / (bytes_per_sample * channels)).try_into().unwrap())
-                    .map_err(|_| ())?;
-
-                let mut byte_offset = 0;
-                for sample in wave_reader.samples().take(sample_count) {
-                    let sample: i16 = sample.map_err(|_| ())?;
-                    match bytes_per_sample {
-                        // From the OpenAL docs: 8-bit PCM data is expressed as
-                        // an unsigned value over the range 0 to 255, 128 being
-                        // an audio output level of zero. Loaded wav samples
-                        // must be converted to that from signed with 0 as
-                        // output level 0.
-                        1 => buffer[byte_offset] = (sample + 128) as u8,
-                        2 => buffer[byte_offset..][..2].copy_from_slice(&sample.to_le_bytes()),
-                        _ => todo!(),
-                    }
-                    byte_offset += bytes_per_sample as usize;
-                }
-                Ok(byte_offset)
-            }
+            AudioFileInner::Wave(ref wave) => wave.read_bytes(offset, buffer),
             AudioFileInner::Symphonia(ref pcm) => pcm.read_bytes(offset, buffer),
         }
     }
