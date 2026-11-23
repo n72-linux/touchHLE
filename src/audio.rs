@@ -12,6 +12,8 @@
 //! Resources:
 //! - [Apple Core Audio Format Specification 1.0](https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/CAF_intro/CAF_intro.html)
 
+#[cfg(all(target_os = "linux", target_arch = "arm"))]
+mod amc;
 mod ima4;
 pub mod openal;
 mod symphonia_formats;
@@ -86,10 +88,11 @@ impl AudioFile {
             let reader = hound::WavReader::new(Cursor::new(bytes)).unwrap();
             Ok(AudioFile(AudioFileInner::Wave(reader)))
         // TODO: Real MP3/MP4/Non-linear PCM container handling. Currently we
-        // are immediately decoding the entire file to PCM and acting as if
-        // it's a PCM file, simply because because this is easier. Full MP3
-        // support would require a lot of changes in Audio Toolbox.
-        } else if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(bytes)) {
+        // decode the file to PCM (on a background thread, a few seconds
+        // around the reads) and act as if it's a PCM file, simply because
+        // this is easier. Full MP3 support would require a lot of changes in Audio
+        // Toolbox.
+        } else if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(bytes) {
             Ok(AudioFile(AudioFileInner::Symphonia(pcm)))
         } else {
             Err(AudioFileOpenError::FileDecodeError)
@@ -162,10 +165,7 @@ impl AudioFile {
                 let sample_count = wave_reader.len(); // position-independent
                 u64::from(sample_count) * self.bytes_per_sample()
             }
-            AudioFileInner::Symphonia(symphonia_formats::SymphoniaDecodedToPcm {
-                ref bytes,
-                ..
-            }) => bytes.len() as u64,
+            AudioFileInner::Symphonia(ref pcm) => pcm.byte_count(),
         }
     }
 
@@ -235,16 +235,7 @@ impl AudioFile {
                 }
                 Ok(byte_offset)
             }
-            AudioFileInner::Symphonia(symphonia_formats::SymphoniaDecodedToPcm {
-                ref bytes,
-                ..
-            }) => {
-                let bytes = bytes.get(offset as usize..).ok_or(())?;
-                let bytes_to_read = buffer.len().min(bytes.len());
-                let bytes = &bytes[..bytes_to_read];
-                buffer[..bytes_to_read].copy_from_slice(bytes);
-                Ok(bytes_to_read)
-            }
+            AudioFileInner::Symphonia(ref pcm) => pcm.read_bytes(offset, buffer),
         }
     }
 
