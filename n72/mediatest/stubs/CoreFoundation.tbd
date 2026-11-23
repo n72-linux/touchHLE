@@ -1,0 +1,10 @@
+--- !tapi-tbd-v2
+archs:           [ armv6 ]
+platform:        ios
+install-name:    /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation
+current-version: 550.52
+compatibility-version: 1
+exports:
+  - archs:       [ armv6 ]
+    symbols:     [ _CFAbsoluteTimeGetCurrent, ___CFConstantStringClassReference ]
+...

@@ -1,0 +1,10 @@
+--- !tapi-tbd-v2
+archs:           [ armv6 ]
+platform:        ios
+install-name:    /usr/lib/libSystem.B.dylib
+current-version: 125.2.11
+compatibility-version: 1
+exports:
+  - archs:       [ armv6 ]
+    symbols:     [ _fopen, _fgets, _fclose, _strlen, _strcmp, _memcpy, _exit, dyld_stub_binder ]
+...

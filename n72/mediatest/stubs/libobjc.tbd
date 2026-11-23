@@ -1,0 +1,10 @@
+--- !tapi-tbd-v2
+archs:           [ armv6 ]
+platform:        ios
+install-name:    /usr/lib/libobjc.A.dylib
+current-version: 227
+compatibility-version: 1
+exports:
+  - archs:       [ armv6 ]
+    symbols:     [ _objc_msgSend, _objc_msgSend_stret, __objc_empty_cache, _OBJC_CLASS_$_NSObject, _OBJC_METACLASS_$_NSObject ]
+...

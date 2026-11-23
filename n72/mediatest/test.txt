@@ -1,0 +1,5 @@
+# N72MediaTest steps, run in order, 3 s apart. One per line:
+#   movie FILE   play the bundle file FILE with MPMoviePlayerController
+# (planned: audio FILE   play it with AVAudioPlayer)
+movie Cut1.mov
+movie Cut1.mov

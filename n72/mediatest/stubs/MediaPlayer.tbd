@@ -1,0 +1,10 @@
+--- !tapi-tbd-v2
+archs:           [ armv6 ]
+platform:        ios
+install-name:    /System/Library/Frameworks/MediaPlayer.framework/MediaPlayer
+current-version: 1
+compatibility-version: 1
+exports:
+  - archs:       [ armv6 ]
+    symbols:     [ _MPMoviePlayerPlaybackDidFinishNotification, _OBJC_CLASS_$_MPMoviePlayerController ]
+...
