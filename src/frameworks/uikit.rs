@@ -118,6 +118,11 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     let mut held_until = None;
     // NSRunLoop will never call this function in headless mode.
     while let Some(event) = env.window_mut().pop_event() {
+        // n72 fork: touches while a movie plays are the movie's.
+        #[cfg(feature = "cpu-native")]
+        let Some(event) = crate::frameworks::media_player::n72_movie_touch(env, event) else {
+            continue;
+        };
         if let Event::TouchesUp(map) = &event {
             if let Some(until) = ui_touch::should_hold_up(env, map) {
                 env.window_mut().unpop_event(event);

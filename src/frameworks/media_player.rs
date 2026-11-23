@@ -41,3 +41,6 @@ pub struct State {
 pub fn handle_players(env: &mut crate::Environment) {
     movie_player::handle_players(env);
 }
+
+#[cfg(feature = "cpu-native")]
+pub use movie_player::n72_movie_touch;
