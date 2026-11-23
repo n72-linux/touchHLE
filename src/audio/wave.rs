@@ -19,8 +19,11 @@ pub struct WaveFile {
 }
 
 impl WaveFile {
-    pub fn new(bytes: Vec<u8>) -> Result<WaveFile, ()> {
-        let reader = hound::WavReader::new(Cursor::new(&bytes[..])).map_err(|_| ())?;
+    /// The bytes back if they are not a WAVE file hound reads.
+    pub fn new(bytes: Vec<u8>) -> Result<WaveFile, Vec<u8>> {
+        let Ok(reader) = hound::WavReader::new(Cursor::new(&bytes[..])) else {
+            return Err(bytes);
+        };
         let spec = reader.spec();
         let num_samples = reader.len();
         // The reader stops right at the data chunk's start; the chunk's

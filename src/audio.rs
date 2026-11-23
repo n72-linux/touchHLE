@@ -22,7 +22,6 @@ mod wave;
 pub use ima4::decode_ima4;
 
 use crate::fs::{Fs, GuestPath};
-use std::io::Cursor;
 
 #[derive(Debug)]
 pub enum AudioFileOpenError {
@@ -80,20 +79,18 @@ impl AudioFile {
     }
 
     pub fn read_from_vec(bytes: Vec<u8>) -> Result<Self, AudioFileOpenError> {
-        if hound::WavReader::new(Cursor::new(&bytes)).is_ok() {
-            let wave =
-                wave::WaveFile::new(bytes).map_err(|_| AudioFileOpenError::FileDecodeError)?;
-            Ok(AudioFile(AudioFileInner::Wave(wave)))
+        let bytes = match wave::WaveFile::new(bytes) {
+            Ok(wave) => return Ok(AudioFile(AudioFileInner::Wave(wave))),
+            Err(bytes) => bytes,
+        };
         // TODO: Real MP3/MP4/Non-linear PCM container handling. Currently we
         // decode the file to PCM (on a background thread, a few seconds
         // around the reads) and act as if it's a PCM file, simply because
-        // this is easier. Full MP3 support would require a lot of changes in Audio
-        // Toolbox.
-        } else if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(bytes) {
-            Ok(AudioFile(AudioFileInner::Symphonia(pcm)))
-        } else {
-            Err(AudioFileOpenError::FileDecodeError)
-        }
+        // this is easier. Full MP3 support would require a lot of changes in
+        // Audio Toolbox.
+        symphonia_formats::decode_symphonia_to_pcm(bytes)
+            .map(|pcm| AudioFile(AudioFileInner::Symphonia(pcm)))
+            .map_err(|_| AudioFileOpenError::FileDecodeError)
     }
 
     pub fn audio_description(&self) -> AudioDescription {
