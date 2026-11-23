@@ -3,19 +3,30 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! n72 (iPod touch 2G under Linux): MP3 decoding on the AMC audio coprocessor
-//! through `/dev/amc` (kernel driver s5l8720-amc, interface in the kernel's
+//! n72 (iPod touch 2G under Linux): MP3, AAC-LC, HE-AAC (v1/v2) and ALAC
+//! decoding on the AMC audio coprocessor through `/dev/amc` (kernel driver
+//! s5l8720-amc, interface in the kernel's
 //! `include/uapi/linux/s5l8720-amc.h`).
 //!
-//! One packet (a whole MP3 frame, header included) in, one frame of
-//! `frames_per_packet` S16_LE interleaved PCM frames out, with no delay
+//! One packet (a whole MP3 frame, header included; a raw AAC access unit; an
+//! ALAC packet as stored in MP4) in, one frame of S16_LE interleaved PCM out
+//! (`frames_per_packet` frames; ALAC: the packet's own count), with no delay
 //! handling: the output is the plain decoder output, like an untrimmed
 //! software decoder's.
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 
-const AMC_CODEC_MP3: u32 = 0;
+/// `enum amc_codec`
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AmcCodec {
+    Mp3 = 0,
+    Aac = 1,
+    HeAac = 2,
+    Alac = 3,
+}
+/// HE-AAC: parametric stereo (HE-AAC v2).
+pub const AMC_START_PS: u32 = 1 << 0;
 const AMC_DECODE_DRAIN: u32 = 1 << 0;
 /// Limits of one `AMC_IOC_DECODE` call.
 pub const AMC_MAX_INPUT: usize = 0x8000;
@@ -62,19 +73,35 @@ const fn iowr(nr: u32, size: usize) -> u32 {
 const AMC_IOC_START: u32 = iowr(0, std::mem::size_of::<AmcStart>());
 const AMC_IOC_DECODE: u32 = iowr(1, std::mem::size_of::<AmcDecode>());
 
-/// A started MP3 stream on the coprocessor. Dropping it closes `/dev/amc`.
+/// What a stream is: `struct amc_start`'s input.
+#[derive(Clone, Copy, Debug)]
+pub struct AmcConfig {
+    pub codec: AmcCodec,
+    /// Output rate (HE-AAC: the SBR rate).
+    pub rate: u32,
+    /// Output channels, 1 or 2.
+    pub channels: u32,
+    /// [AMC_START_PS] or 0.
+    pub flags: u32,
+    /// ALAC: bitDepth, pb, mb, kb from the 'alac' atom.
+    pub cookie: [u8; 4],
+}
+
+/// A started stream on the coprocessor. Dropping it closes `/dev/amc`.
 pub struct Amc {
     file: File,
-    rate: u32,
-    channels: u32,
+    config: AmcConfig,
     /// PCM frames per packet, as the driver reports it.
     pub frames_per_packet: u32,
 }
 
 /// What one [Amc::decode] call did.
 pub struct Decoded {
-    /// Packets decoded, each `frames_per_packet` frames of output.
+    /// Packets decoded, each `frames_per_packet` frames of output (ALAC:
+    /// its own count).
     pub packets_done: usize,
+    /// PCM bytes written.
+    pub out_bytes: usize,
     /// Why the call stopped before the last packet, if it did. The stream
     /// needs a new start afterwards.
     pub failure: Option<String>,
@@ -93,7 +120,7 @@ fn errno_text() -> String {
 }
 
 impl Amc {
-    pub fn start_mp3(rate: u32, channels: u32) -> Result<Amc, String> {
+    pub fn start(config: AmcConfig) -> Result<Amc, String> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -101,8 +128,7 @@ impl Amc {
             .map_err(|e| format!("/dev/amc: {e}"))?;
         let mut amc = Amc {
             file,
-            rate,
-            channels,
+            config,
             frames_per_packet: 0,
         };
         amc.restart()?;
@@ -112,10 +138,13 @@ impl Amc {
     /// Start the stream (again): a fresh decoder state, e.g. after a gap in
     /// the packets or a decoder error.
     pub fn restart(&mut self) -> Result<(), String> {
+        let c = self.config;
         let mut s = AmcStart {
-            codec: AMC_CODEC_MP3,
-            rate: self.rate,
-            channels: self.channels,
+            codec: c.codec as u32,
+            rate: c.rate,
+            channels: c.channels,
+            flags: c.flags,
+            cookie: c.cookie,
             ..Default::default()
         };
         // SAFETY: the struct matches the driver's struct amc_start.
@@ -128,7 +157,8 @@ impl Amc {
 
     /// Decode `sizes.len()` packets (at most [AMC_MAX_PACKETS], together at
     /// most [AMC_MAX_INPUT] bytes) lying back to back in `input` into `out`,
-    /// which must hold `frames_per_packet` frames per packet. `drain` marks
+    /// which must hold `frames_per_packet` frames per packet; the frames come
+    /// back to back (ALAC: as many as each packet has). `drain` marks
     /// the last call of the stream.
     pub fn decode(&mut self, input: &[u8], sizes: &[u32], out: &mut [u8], drain: bool) -> Decoded {
         let mut d = AmcDecode {
@@ -157,6 +187,7 @@ impl Amc {
         };
         Decoded {
             packets_done: (d.packets_done as usize).min(sizes.len()),
+            out_bytes: (d.out_bytes as usize).min(out.len()),
             bitstream_error: ret == 0 && d.error != 0,
             failure,
         }

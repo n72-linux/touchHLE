@@ -302,23 +302,243 @@ fn mpeg_frame_block(data: &[u8]) -> Option<u64> {
     }
 }
 
-/// The frames a packet decodes to, as symphonia's decoder outputs them.
+/// What a track's codec is, as far as the frame count, the AMC and the
+/// software decoder care.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    Mp3,
+    /// AAC-LC: 1024 frames per packet. `amc`: 1 or 2 channels (what the AMC
+    /// takes).
+    Aac {
+        amc: bool,
+    },
+    /// HE-AAC (SBR, v2 with `ps`): 2048 frames per packet at twice the core
+    /// rate. Symphonia has no SBR: in software only the AAC-LC core decodes
+    /// (`core`: its sampling frequency index and channels, if a plain AAC-LC
+    /// config can say them).
+    HeAac {
+        ps: bool,
+        rate: u32,
+        channels: u32,
+        core: Option<(u8, u8)>,
+    },
+    /// ALAC: bitDepth, pb, mb, kb from the 'alac' atom; `amc`: 16-bit, 4096
+    /// frames per packet, 1 or 2 channels (what the AMC takes).
+    Alac {
+        cookie: [u8; 4],
+        amc: bool,
+    },
+    Other,
+}
+
+const AAC_RATES: [u32; 13] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+/// Big-endian bit reader over an AudioSpecificConfig.
+struct Bits<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn remaining(&self) -> usize {
+        (self.bytes.len() * 8).saturating_sub(self.pos)
+    }
+    fn peek(&self, n: usize) -> Option<u32> {
+        if n > self.remaining() {
+            return None;
+        }
+        let mut v = 0u32;
+        for i in self.pos..self.pos + n {
+            v = (v << 1) | u32::from((self.bytes[i / 8] >> (7 - i % 8)) & 1);
+        }
+        Some(v)
+    }
+    fn read(&mut self, n: usize) -> Option<u32> {
+        let v = self.peek(n)?;
+        self.pos += n;
+        Some(v)
+    }
+    fn aot(&mut self) -> Option<u32> {
+        let a = self.read(5)?;
+        Some(if a == 31 { 32 + self.read(6)? } else { a })
+    }
+    /// Sampling frequency: (index, Hz).
+    fn rate(&mut self) -> Option<(u32, u32)> {
+        let i = self.read(4)?;
+        if i == 15 {
+            Some((15, self.read(24)?))
+        } else {
+            Some((i, *AAC_RATES.get(i as usize)?))
+        }
+    }
+}
+
+/// An AudioSpecificConfig, as gstamcdec reads it: the object type (after
+/// the SBR/PS wrapper), the core rate and channels, and SBR/PS signalled
+/// explicitly (object type 5 or 29) or backward compatibly (sync
+/// extensions 0x2b7 and 0x548).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Asc {
+    pub aot: u32,
+    pub rate_index: u32,
+    pub rate: u32,
+    pub channels: u32,
+    pub sbr: bool,
+    pub ps: bool,
+    /// The SBR (output) rate, if given.
+    pub ext_rate: Option<u32>,
+}
+
+pub(super) fn parse_asc(bytes: &[u8]) -> Option<Asc> {
+    let mut b = Bits { bytes, pos: 0 };
+    let mut aot = b.aot()?;
+    let (rate_index, rate) = b.rate()?;
+    let channels = b.read(4)?;
+    let (mut sbr, mut ps, mut ext_rate) = (false, false, None);
+    if aot == 5 || aot == 29 {
+        sbr = true;
+        ps = aot == 29;
+        ext_rate = Some(b.rate()?.1);
+        aot = b.aot()?;
+    }
+    if aot == 2 && b.read(3).is_some() {
+        // GASpecificConfig, then the extensions
+        while b.remaining() >= 16 {
+            match b.peek(11)? {
+                0x2b7 => {
+                    b.read(11)?;
+                    if b.aot()? == 5 && b.read(1)? == 1 {
+                        sbr = true;
+                        ext_rate = Some(b.rate()?.1);
+                    }
+                }
+                0x548 => {
+                    b.read(11)?;
+                    if b.read(1)? == 1 {
+                        ps = true;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    Some(Asc {
+        aot,
+        rate_index,
+        rate,
+        channels,
+        sbr,
+        ps,
+        ext_rate,
+    })
+}
+
+/// A plain AAC-LC AudioSpecificConfig.
+fn lc_asc(rate_index: u8, channels: u8) -> [u8; 2] {
+    let v: u16 = (2 << 11) | (u16::from(rate_index) << 7) | (u16::from(channels) << 3);
+    v.to_be_bytes()
+}
+
+/// The 24-byte ALAC specific config in an 'alac' magic cookie (24 bytes, or
+/// 48 with the 'frma' and 'alac' atom headers in front).
+fn alac_config(cookie: &[u8]) -> Option<&[u8]> {
+    match cookie.len() {
+        24 => Some(cookie),
+        48 if &cookie[4..8] == b"frma" => Some(&cookie[24..48]),
+        _ => None,
+    }
+}
+
+impl Kind {
+    pub(super) fn of(params: &AudioCodecParameters) -> Kind {
+        let extra = params.extra_data.as_deref();
+        match params.codec {
+            c if c == CODEC_ID_MP3 => Kind::Mp3,
+            c if c == CODEC_ID_AAC => match extra.and_then(parse_asc) {
+                Some(asc) if asc.aot == 2 && asc.sbr && (1..=2).contains(&asc.channels) => {
+                    let core =
+                        (asc.rate_index < 13).then_some((asc.rate_index as u8, asc.channels as u8));
+                    Kind::HeAac {
+                        ps: asc.ps,
+                        rate: asc.ext_rate.unwrap_or(2 * asc.rate),
+                        channels: if asc.ps { 2 } else { asc.channels },
+                        core,
+                    }
+                }
+                Some(asc) => Kind::Aac {
+                    amc: asc.aot == 2 && (1..=2).contains(&asc.channels),
+                },
+                None => Kind::Aac { amc: false },
+            },
+            c if c == CODEC_ID_ALAC => {
+                let Some(c) = extra.and_then(alac_config) else {
+                    return Kind::Alac {
+                        cookie: [0; 4],
+                        amc: false,
+                    };
+                };
+                let frame_length = u32::from_be_bytes(c[0..4].try_into().unwrap());
+                Kind::Alac {
+                    cookie: c[5..9].try_into().unwrap(),
+                    amc: frame_length == 4096 && c[5] == 16 && (1..=2).contains(&c[9]),
+                }
+            }
+            _ => Kind::Other,
+        }
+    }
+
+    pub(super) fn name(&self, codec: AudioCodecId) -> &'static str {
+        match self {
+            Kind::Mp3 => "MP3",
+            Kind::Aac { .. } => "AAC",
+            Kind::HeAac { ps: false, .. } => "HE-AAC",
+            Kind::HeAac { ps: true, .. } => "HE-AAC v2",
+            Kind::Alac { .. } => "ALAC",
+            Kind::Other if codec == CODEC_ID_ADPCM_IMA_WAV || codec == CODEC_ID_ADPCM_IMA_QT => {
+                "IMA ADPCM"
+            }
+            Kind::Other => "PCM",
+        }
+    }
+
+    /// The software decoder's parameters: HE-AAC as its AAC-LC core.
+    fn soft_params(&self, params: &AudioCodecParameters) -> Option<AudioCodecParameters> {
+        match *self {
+            Kind::HeAac { core, .. } => {
+                let (index, channels) = core?;
+                let mut p = params.clone();
+                p.extra_data = Some(Box::new(lc_asc(index, channels)));
+                p.sample_rate = Some(AAC_RATES[index as usize]);
+                Some(p)
+            }
+            _ => Some(params.clone()),
+        }
+    }
+}
+
+/// The frames a packet decodes to, as the decoders output them.
 ///
 /// MP3: the decoder (gapless, symphonia's default) trims `trim_end` and then
 /// `trim_start` frames from the frame's full block (the encoder delay and
 /// padding of the LAME tag). The block comes from the header: symphonia
 /// 0.6.0's MP3 demuxer leaves `dur` at the untrimmed block (its
 /// `trimmed_dur` subtracts the builder's zero trims), so `dur` cannot be used
-/// there. The other demuxers make untrimmed packets of `dur` frames, and their
-/// decoders do not trim.
-fn packet_frames(packet: &Packet, is_mp3: bool) -> u64 {
-    if is_mp3 {
-        let block = mpeg_frame_block(&packet.data).unwrap_or(packet.dur.get());
-        block
-            .saturating_sub(packet.trim_end.get())
-            .saturating_sub(packet.trim_start.get())
-    } else {
-        packet.dur.get()
+/// there. AAC: a whole frame for every packet, the last one too (its `dur`
+/// may be shorter; neither the AMC nor symphonia cut it). The other demuxers
+/// make untrimmed packets of `dur` frames, and their decoders do not trim.
+fn packet_frames(packet: &Packet, kind: Kind) -> u64 {
+    match kind {
+        Kind::Mp3 => {
+            let block = mpeg_frame_block(&packet.data).unwrap_or(packet.dur.get());
+            block
+                .saturating_sub(packet.trim_end.get())
+                .saturating_sub(packet.trim_start.get())
+        }
+        Kind::Aac { .. } => 1024,
+        Kind::HeAac { .. } => 2048,
+        _ => packet.dur.get(),
     }
 }
 
@@ -343,36 +563,99 @@ fn make_decoder(params: &AudioCodecParameters) -> Result<Box<dyn AudioDecoder>, 
         .map_err(|_| ())
 }
 
-fn codec_name(codec: AudioCodecId) -> &'static str {
-    match codec {
-        c if c == CODEC_ID_MP3 => "MP3",
-        c if c == CODEC_ID_AAC => "AAC",
-        c if c == CODEC_ID_ALAC => "ALAC",
-        c if c == CODEC_ID_ADPCM_IMA_WAV || c == CODEC_ID_ADPCM_IMA_QT => "IMA ADPCM",
-        _ => "PCM",
-    }
-}
-
-/// Software decoding of one packet to S16_LE interleaved PCM.
-struct Soft {
-    decoder: Box<dyn AudioDecoder>,
+/// Software decoding of one packet to S16_LE interleaved PCM at the stream's
+/// rate and channels.
+pub(super) struct Soft {
+    decoder: Option<Box<dyn AudioDecoder>>,
+    params: Option<AudioCodecParameters>,
     buf: Vec<u8>,
-    rate: u32,
-    channels: u32,
+    out: Vec<u8>,
+    pub rate: u32,
+    pub channels: u32,
+    /// HE-AAC's core: rate and channels the decoder gives, upsampled 2x
+    /// (linear) and mono doubled to stereo (PS).
+    core: Option<(u32, u32)>,
+    /// The last core frame (interpolation across packets).
+    last: [i16; 2],
 }
 
 impl Soft {
+    /// `None` decoder: none can decode this (HE-AAC without a usable core).
+    pub(super) fn new(kind: Kind, params: &AudioCodecParameters, rate: u32, channels: u32) -> Soft {
+        let params = kind.soft_params(params);
+        let core = match kind {
+            Kind::HeAac {
+                core: Some((index, ch)),
+                ..
+            } => Some((AAC_RATES[index as usize], u32::from(ch))),
+            _ => None,
+        };
+        Soft {
+            decoder: params.as_ref().and_then(|p| make_decoder(p).ok()),
+            params,
+            buf: Vec::new(),
+            out: Vec::new(),
+            rate,
+            channels,
+            core,
+            last: [0; 2],
+        }
+    }
+
+    pub(super) fn available(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    /// Start over with a fresh decoder state (symphonia's `reset()` does not
+    /// clear all of the AAC decoder's state).
+    pub(super) fn fresh(&mut self) {
+        if let Some(p) = &self.params {
+            if let Ok(decoder) = make_decoder(p) {
+                self.decoder = Some(decoder);
+            }
+        }
+        self.last = [0; 2];
+    }
+
     /// The packet's PCM, or `None` if it does not decode (to the stream's
     /// rate and channels).
-    fn decode(&mut self, packet: &Packet) -> Option<&[u8]> {
-        let decoded = self.decoder.decode(packet).ok()?;
+    pub(super) fn decode(&mut self, packet: &Packet) -> Option<&[u8]> {
+        let decoded = self.decoder.as_mut()?.decode(packet).ok()?;
         let spec = decoded.spec();
-        if spec.rate() != self.rate || spec.channels().count() != self.channels as usize {
+        let (rate, channels) = self.core.unwrap_or((self.rate, self.channels));
+        if spec.rate() != rate || spec.channels().count() != channels as usize {
             return None;
         }
         self.buf.clear();
         decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut self.buf);
-        Some(&self.buf)
+        if self.core.is_none() {
+            return Some(&self.buf);
+        }
+        // HE-AAC core: twice the frames, by linear interpolation; mono to
+        // both channels for PS.
+        let (ci, co) = (channels as usize, self.channels as usize);
+        self.out.clear();
+        self.out.reserve(self.buf.len() * 2 * co / ci);
+        for frame in self.buf.chunks_exact(2 * ci) {
+            let mut now = [0i16; 2];
+            for (c, s) in now.iter_mut().enumerate().take(ci) {
+                *s = i16::from_le_bytes([frame[2 * c], frame[2 * c + 1]]);
+            }
+            if ci == 1 {
+                now[1] = now[0];
+            }
+            let mid = [
+                ((i32::from(self.last[0]) + i32::from(now[0])) / 2) as i16,
+                ((i32::from(self.last[1]) + i32::from(now[1])) / 2) as i16,
+            ];
+            for f in [mid, now] {
+                for s in f.iter().take(co) {
+                    self.out.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+            self.last = now;
+        }
+        Some(&self.out)
     }
 }
 
@@ -394,11 +677,11 @@ fn spec_from_first_packet(data: &SharedBytes) -> Result<(u32, u32), ()> {
 }
 
 /// The PCM frames of the track: a demux-only pass through symphonia.
-fn frames_by_demuxing(data: &SharedBytes, is_mp3: bool) -> Result<u64, ()> {
+fn frames_by_demuxing(data: &SharedBytes, kind: Kind) -> Result<u64, ()> {
     let (mut reader, track_id, _) = open_reader(data)?;
     let mut frames: u64 = 0;
     while let Some(packet) = next_packet(&mut *reader, track_id)? {
-        frames += packet_frames(&packet, is_mp3);
+        frames += packet_frames(&packet, kind);
     }
     Ok(frames)
 }
@@ -543,22 +826,24 @@ pub fn decode_symphonia_to_pcm(bytes: Vec<u8>) -> Result<SymphoniaDecodedToPcm, 
     // headers, the rest (or MP3 the hop does not understand) by a demux-only
     // pass.
     let (reader, track_id, params) = open_reader(&data)?;
-    let is_mp3 = params.codec == CODEC_ID_MP3;
-    let hopped = if is_mp3 {
+    let kind = Kind::of(&params);
+    let hopped = if kind == Kind::Mp3 {
         mp3_frames_by_hopping(reader, &data.0)
     } else {
         None
     };
     let frames = match hopped {
         Some(frames) => frames,
-        None => frames_by_demuxing(&data, is_mp3)?,
+        None => frames_by_demuxing(&data, kind)?,
     };
     if frames == 0 {
         return Err(());
     }
 
-    let (sample_rate, channels) = match (params.sample_rate, params.channels.as_ref()) {
-        (Some(rate), Some(channels)) => (rate, channels.count().try_into().map_err(|_| ())?),
+    let (sample_rate, channels) = match (kind, params.sample_rate, params.channels.as_ref()) {
+        // The output: the SBR rate.
+        (Kind::HeAac { rate, channels, .. }, _, _) => (rate, channels),
+        (_, Some(rate), Some(channels)) => (rate, channels.count().try_into().map_err(|_| ())?),
         _ => spec_from_first_packet(&data)?,
     };
     if sample_rate == 0 || channels == 0 {
@@ -573,7 +858,11 @@ pub fn decode_symphonia_to_pcm(bytes: Vec<u8>) -> Result<SymphoniaDecodedToPcm, 
     let ahead = AHEAD_SECONDS * second;
     let behind = BEHIND_SECONDS * second;
 
-    let decoder = make_decoder(&params)?;
+    let soft = Soft::new(kind, &params, sample_rate, channels);
+    // Without a software decoder only HE-AAC opens (the AMC may take it).
+    if !soft.available() && !matches!(kind, Kind::HeAac { .. }) {
+        return Err(());
+    }
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             // The window at once (plus a read and a batch of packets): no
@@ -594,20 +883,13 @@ pub fn decode_symphonia_to_pcm(bytes: Vec<u8>) -> Result<SymphoniaDecodedToPcm, 
         behind,
         prime: PRIME_FRAMES * frame_bytes,
     });
-    let name = codec_name(params.codec);
     let job = Decode {
         data,
-        params,
         track_id,
-        is_mp3,
-        name,
+        kind,
+        name: kind.name(params.codec),
         frames,
-        soft: Soft {
-            decoder,
-            buf: Vec::new(),
-            rate: sample_rate,
-            channels,
-        },
+        soft,
         shared: shared.clone(),
     };
     let thread = std::thread::Builder::new()
@@ -708,9 +990,8 @@ enum End {
 /// The decoder thread's job.
 struct Decode {
     data: SharedBytes,
-    params: AudioCodecParameters,
     track_id: u32,
-    is_mp3: bool,
+    kind: Kind,
     name: &'static str,
     /// Announced length in frames.
     frames: u64,
@@ -734,15 +1015,27 @@ impl Packets {
     }
 }
 
-impl Decode {
-    /// A new software decoder (symphonia's `reset()` does not clear all of
-    /// the AAC decoder's state).
-    fn fresh_decoder(&mut self) {
-        if let Ok(decoder) = make_decoder(&self.params) {
-            self.soft.decoder = decoder;
-        }
-    }
+/// The AMC's configuration for a stream, if it takes it.
+#[cfg(all(target_os = "linux", target_arch = "arm"))]
+fn amc_config(kind: Kind, rate: u32, channels: u32) -> Option<super::amc::AmcConfig> {
+    use super::amc::{AmcCodec, AmcConfig, AMC_START_PS};
+    let (codec, flags, cookie) = match kind {
+        Kind::Mp3 => (AmcCodec::Mp3, 0, [0; 4]),
+        Kind::Aac { amc: true } => (AmcCodec::Aac, 0, [0; 4]),
+        Kind::HeAac { ps, .. } => (AmcCodec::HeAac, if ps { AMC_START_PS } else { 0 }, [0; 4]),
+        Kind::Alac { cookie, amc: true } => (AmcCodec::Alac, 0, cookie),
+        _ => return None,
+    };
+    Some(AmcConfig {
+        codec,
+        rate,
+        channels,
+        flags,
+        cookie,
+    })
+}
 
+impl Decode {
     fn describe(&self) -> String {
         format!(
             "{} Hz, {} ch, {} frames ({:.1} s)",
@@ -757,9 +1050,9 @@ impl Decode {
         let _finish = FinishOnDrop(self.shared.clone());
         lower_priority();
 
-        // MP3 on the AMC until it fails once; then the CPU for good.
+        // On the AMC until it fails once; then the CPU for good.
         #[allow(unused_mut)]
-        let mut use_amc = cfg!(all(target_os = "linux", target_arch = "arm")) && self.is_mp3;
+        let mut use_amc = cfg!(all(target_os = "linux", target_arch = "arm"));
         let mut first = true;
         loop {
             self.shared.begin_pass();
@@ -767,7 +1060,9 @@ impl Decode {
                 reader: open_reader(&self.data).ok().map(|r| r.0),
                 track_id: self.track_id,
             };
-            self.fresh_decoder();
+            if !first {
+                self.soft.fresh();
+            }
             let end = self.pass(&mut packets, &mut use_amc, first);
             first = false;
             match end {
@@ -790,9 +1085,19 @@ impl Decode {
         #[allow(unused_mut)]
         let mut pos = 0;
 
+        // HE-AAC in software: the core only.
+        let note = match self.kind {
+            Kind::HeAac { .. } if self.soft.available() => {
+                ", the AAC-LC core only (no SBR decoder), upsampled"
+            }
+            Kind::HeAac { .. } => ", no decoder for it: silence",
+            _ => "",
+        };
         #[cfg(all(target_os = "linux", target_arch = "arm"))]
-        if *use_amc {
-            match super::amc::Amc::start_mp3(self.soft.rate, self.soft.channels) {
+        let config = amc_config(self.kind, self.soft.rate, self.soft.channels).filter(|_| *use_amc);
+        #[cfg(all(target_os = "linux", target_arch = "arm"))]
+        if let Some(config) = config {
+            match super::amc::Amc::start(config) {
                 Ok(amc) => {
                     if first {
                         log!("{} on the AMC, {}", self.name, self.describe());
@@ -801,10 +1106,11 @@ impl Decode {
                         Ok(end) => return end,
                         Err((rest, why, at)) => {
                             log!(
-                                "{}: the AMC stopped at frame {} ({}), software decoding from there",
+                                "{}: the AMC stopped at frame {} ({}), software decoding from there{}",
                                 self.name,
                                 at / self.shared.frame_bytes,
-                                why
+                                why,
+                                note
                             );
                             *use_amc = false;
                             pending = rest;
@@ -815,21 +1121,22 @@ impl Decode {
                 Err(why) => {
                     if first {
                         log!(
-                            "{} in software (AMC: {}), {}",
+                            "{} in software (AMC: {}), {}{}",
                             self.name,
                             why,
-                            self.describe()
+                            self.describe(),
+                            note
                         );
                     }
                 }
             }
         } else if first {
-            log!("{} in software, {}", self.name, self.describe());
+            log!("{} in software, {}{}", self.name, self.describe(), note);
         }
         #[cfg(not(all(target_os = "linux", target_arch = "arm")))]
         if first {
             let _ = use_amc;
-            log!("{} in software, {}", self.name, self.describe());
+            log!("{} in software, {}{}", self.name, self.describe(), note);
         }
 
         self.run_soft(packets, pending, history, pos)
@@ -845,6 +1152,10 @@ impl Decode {
         history: VecDeque<Packet>,
         mut pos: usize,
     ) -> End {
+        if !self.soft.available() {
+            // Nothing decodes it: the reads get silence.
+            return End::Done;
+        }
         for packet in &history {
             let _ = self.soft.decode(packet);
         }
@@ -854,7 +1165,7 @@ impl Decode {
             let Some(packet) = pending.next().or_else(|| packets.next()) else {
                 return End::Done;
             };
-            let frames = packet_frames(&packet, self.is_mp3);
+            let frames = packet_frames(&packet, self.kind);
             let bytes = frames as usize * self.shared.frame_bytes;
             match self.shared.step(pos, bytes, true) {
                 Step::Stop => return End::Stop,
@@ -862,7 +1173,7 @@ impl Decode {
                 Step::Skipped => gap = true,
                 Step::Decode | Step::Hold => {
                     if gap {
-                        self.fresh_decoder();
+                        self.soft.fresh();
                         gap = false;
                     }
                     // A packet that does not decode becomes silence, so that
@@ -875,8 +1186,8 @@ impl Decode {
         }
     }
 
-    /// MP3 on the AMC. On a failure: the packets not decoded (the current one
-    /// and the rest read ahead), why, and the stream position.
+    /// The AMC. On a failure: the packets not decoded (the current one and
+    /// the rest read ahead), why, and the stream position.
     #[cfg(all(target_os = "linux", target_arch = "arm"))]
     #[allow(clippy::type_complexity)]
     fn run_amc(
@@ -886,11 +1197,27 @@ impl Decode {
         history: &mut VecDeque<Packet>,
     ) -> Result<End, (Vec<Packet>, String, usize)> {
         use super::amc::{AMC_MAX_INPUT, AMC_MAX_PACKETS};
-        // Small calls: the first read (half a second) comes back soon.
-        const BATCH: usize = 16;
-        const _: () = assert!(BATCH <= AMC_MAX_PACKETS);
+        // Small calls: the first read (half a second) comes back soon. ALAC
+        // one packet at a time: its frames per packet vary (the last one),
+        // and the output comes back to back.
+        const MAX_BATCH: usize = 16;
+        const _: () = assert!(MAX_BATCH <= AMC_MAX_PACKETS);
+        let kind = self.kind;
+        let alac = matches!(kind, Kind::Alac { .. });
+        let batch_max = if alac { 1 } else { MAX_BATCH };
+        const BATCH: usize = MAX_BATCH;
 
         let fpp = u64::from(amc.frames_per_packet);
+        let expected_fpp = match kind {
+            Kind::Aac { .. } => Some(1024),
+            Kind::HeAac { .. } => Some(2048),
+            Kind::Alac { .. } => Some(4096),
+            _ => None,
+        };
+        if expected_fpp.is_some_and(|f| f != fpp) {
+            let first: Vec<Packet> = packets.next().into_iter().collect();
+            return Err((first, format!("{fpp} frames per packet"), 0));
+        }
         let frame_bytes = self.shared.frame_bytes;
         let packet_bytes = amc.frames_per_packet as usize * frame_bytes;
         let mut out = vec![0u8; packet_bytes * BATCH];
@@ -911,11 +1238,12 @@ impl Decode {
             let mut batch_end = pos;
             while let Some(packet) = next.take() {
                 let len = packet.data.len();
-                let fits = mpeg_frame_block(&packet.data) == Some(fpp)
+                let fits = (kind != Kind::Mp3 || mpeg_frame_block(&packet.data) == Some(fpp))
+                    && (!alac || packet.dur.get() <= fpp)
                     && len > 0
                     && input.len() + len <= AMC_MAX_INPUT;
-                let bytes = packet_frames(&packet, true) as usize * frame_bytes;
-                if batch.len() == BATCH || !fits {
+                let bytes = packet_frames(&packet, kind) as usize * frame_bytes;
+                if batch.len() == batch_max || !fits {
                     next = Some(packet);
                     break;
                 }
@@ -962,9 +1290,14 @@ impl Decode {
             let last = next.is_none();
             let r = amc.decode(&input, &sizes, &mut out[..packet_bytes * batch.len()], last);
             for (i, packet) in batch.drain(..r.packets_done).enumerate() {
-                let pcm = &out[i * packet_bytes..][..packet_bytes];
+                let pcm = if alac {
+                    &out[..r.out_bytes]
+                } else {
+                    &out[i * packet_bytes..][..packet_bytes]
+                };
+                // MP3: as symphonia trims it (AAC packets have no trims).
                 let pcm = trim_like_symphonia(pcm, &packet, frame_bytes);
-                let frames = packet_frames(&packet, true);
+                let frames = packet_frames(&packet, kind);
                 self.shared.push(pcm, frames);
                 pos += frames as usize * frame_bytes;
                 if history.len() == HISTORY {
@@ -978,7 +1311,7 @@ impl Decode {
                     // ones after a jump, without their bit reservoir): start
                     // again after it.
                     let bad = &batch[0];
-                    let frames = packet_frames(bad, true);
+                    let frames = packet_frames(bad, kind);
                     let bad_end = pos + frames as usize * frame_bytes;
                     if self.shared.dropped_below(bad_end) && amc.restart().is_ok() {
                         batch.remove(0);
@@ -1058,7 +1391,7 @@ mod tests {
             let trimmed = trim_like_symphonia(&buf, &packet, frame_bytes);
             assert_eq!(
                 trimmed.len() as u64,
-                packet_frames(&packet, true) * frame_bytes as u64
+                packet_frames(&packet, Kind::Mp3) * frame_bytes as u64
             );
             out.extend_from_slice(trimmed);
         }
@@ -1091,21 +1424,19 @@ mod tests {
         Some(std::fs::read(out).unwrap())
     }
 
-    fn check(bytes: Vec<u8>, exact_length: bool) {
+    /// `exact`: restarts and jumps give the same bytes (MP3, ALAC; AAC is
+    /// within 2 LSB there).
+    fn check(bytes: Vec<u8>, mp3: bool, exact: bool) {
+        let exact_length = exact;
         let reference = decode_whole(bytes.clone());
         let bytes_again = bytes.clone();
-        if exact_length {
+        if mp3 {
             check_amc_layout(bytes.clone(), &reference);
         }
         let pcm = decode_symphonia_to_pcm(bytes).unwrap();
         let len = pcm.byte_count() as usize;
-        if exact_length {
-            assert_eq!(len, reference.len());
-        } else {
-            // Containers whose last packet decodes to more than it lasts:
-            // cut at the announced length.
-            assert!(len <= reference.len() && reference.len() - len < 4096 * 4);
-        }
+        // The announced length is what the whole-file decode gave.
+        assert_eq!(len, reference.len());
         // Reads of odd sizes from the start, while the thread decodes, then a
         // loop back to 0.
         let mut got = vec![0u8; len];
@@ -1144,7 +1475,7 @@ mod tests {
             let n = chunk.min(len - offset);
             let mut again = vec![0u8; n];
             assert_eq!(pcm.read_bytes(offset as u64, &mut again), Ok(n));
-            if exact_length || offset < len / 2 {
+            {
                 // MP3 restarts are exact; AAC after a jump is within an LSB
                 // (the decoder's state is not quite the same).
                 let diff = again
@@ -1189,7 +1520,7 @@ mod tests {
             // With the LAME (Info) tag: gapless trimming.
             let mp3 = dir.join(format!("tag-{rate}-{seconds}.mp3"));
             if let Some(b) = encode("lame", &["--quiet", wav_s, mp3.to_str().unwrap()], &mp3) {
-                check(b, true);
+                check(b, true, true);
                 ran += 1;
             }
             // Without it, VBR.
@@ -1199,7 +1530,7 @@ mod tests {
                 &["--quiet", "-t", "-V", "4", wav_s, mp3.to_str().unwrap()],
                 &mp3,
             ) {
-                check(b, true);
+                check(b, true, true);
                 ran += 1;
             }
             let m4a = dir.join(format!("aac-{rate}-{seconds}.m4a"));
@@ -1217,7 +1548,32 @@ mod tests {
                 ],
                 &m4a,
             ) {
-                check(b, false);
+                check(b, false, false);
+                ran += 1;
+            }
+            let alac = dir.join(format!("alac-{rate}-{seconds}.m4a"));
+            if let Some(b) = encode(
+                "ffmpeg",
+                &[
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    wav_s,
+                    "-c:a",
+                    "alac",
+                    alac.to_str().unwrap(),
+                ],
+                &alac,
+            ) {
+                let data = SharedBytes(Arc::new(b.clone()));
+                let (_, _, params) = open_reader(&data).unwrap();
+                assert!(
+                    matches!(Kind::of(&params), Kind::Alac { amc: true, .. }),
+                    "{:?}",
+                    Kind::of(&params)
+                );
+                check(b, false, true);
                 ran += 1;
             }
         }
@@ -1225,6 +1581,80 @@ mod tests {
         if ran == 0 {
             eprintln!("lame/ffmpeg not found: nothing tested");
         }
+    }
+
+    #[test]
+    fn asc() {
+        // AAC-LC 44.1 kHz stereo
+        let lc = parse_asc(&[0x12, 0x10]).unwrap();
+        assert_eq!((lc.aot, lc.rate, lc.channels, lc.sbr), (2, 44100, 2, false));
+        assert_eq!(lc_asc(4, 2), [0x12, 0x10]);
+        // HE-AAC explicit: object type 5, 22.05 kHz core, stereo, SBR at
+        // 44.1 kHz, then AAC-LC.
+        let he = parse_asc(&[0x2b, 0x92, 0x08, 0x00]).unwrap();
+        assert_eq!(
+            (he.aot, he.rate, he.channels, he.sbr, he.ps, he.ext_rate),
+            (2, 22050, 2, true, false, Some(44100))
+        );
+        // HE-AAC v2 explicit: object type 29, mono core.
+        let v2 = parse_asc(&[0xeb, 0x8a, 0x08, 0x00]).unwrap();
+        assert_eq!((v2.aot, v2.channels, v2.sbr, v2.ps), (2, 1, true, true));
+        // Backward-compatible SBR: AAC-LC 22.05 kHz stereo, sync extension
+        // 0x2b7, object type 5, SBR present, 44.1 kHz.
+        let bc = parse_asc(&[0x13, 0x90, 0x56, 0xe5, 0xa0]).unwrap();
+        assert_eq!(
+            (bc.aot, bc.rate, bc.sbr, bc.ext_rate),
+            (2, 22050, true, Some(44100))
+        );
+    }
+
+    /// HE-AAC (afconvert on macOS): the length at the SBR rate, 2048 frames
+    /// per packet; in software the AAC-LC core, upsampled.
+    #[test]
+    fn he_aac_core() {
+        let dir = std::env::temp_dir().join(format!("touchhle-audio-he-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("in.wav");
+        write_wav(&wav, 44100, 2, 44100 * 5);
+        for (format, ps) in [("aach", false), ("aacp", true)] {
+            let m4a = dir.join(format!("{format}.m4a"));
+            let Some(b) = encode(
+                "afconvert",
+                &[
+                    "-f",
+                    "m4af",
+                    "-d",
+                    format,
+                    wav.to_str().unwrap(),
+                    m4a.to_str().unwrap(),
+                ],
+                &m4a,
+            ) else {
+                continue;
+            };
+            let data = SharedBytes(Arc::new(b.clone()));
+            let (mut reader, track_id, params) = open_reader(&data).unwrap();
+            let kind = Kind::of(&params);
+            assert!(
+                matches!(kind, Kind::HeAac { ps: p, rate: 44100, channels: 2, core: Some(_) } if p == ps),
+                "{kind:?}"
+            );
+            let mut packets = 0u64;
+            while next_packet(&mut *reader, track_id).unwrap().is_some() {
+                packets += 1;
+            }
+            let pcm = decode_symphonia_to_pcm(b).unwrap();
+            assert_eq!((pcm.sample_rate, pcm.channels), (44100, 2));
+            assert_eq!(pcm.byte_count(), packets * 2048 * 4);
+            let mut all = vec![0u8; pcm.byte_count() as usize];
+            assert_eq!(pcm.read_bytes(0, &mut all), Ok(all.len()));
+            // The core decodes: sound in the middle.
+            let mid = &all[all.len() / 2..][..4096];
+            assert!(mid
+                .chunks(2)
+                .any(|s| i16::from_le_bytes([s[0], s[1]]).abs() > 1000));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The header hop counts what the demux pass counts.
@@ -1267,7 +1697,7 @@ mod tests {
                         }
                     }
                     let data = SharedBytes(Arc::new(bytes.clone()));
-                    let demuxed = frames_by_demuxing(&data, true).unwrap();
+                    let demuxed = frames_by_demuxing(&data, Kind::Mp3).unwrap();
                     let (reader, _, _) = open_reader(&data).unwrap();
                     let hopped = mp3_frames_by_hopping(reader, &bytes);
                     assert_eq!(
