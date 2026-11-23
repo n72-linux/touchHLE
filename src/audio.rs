@@ -20,6 +20,7 @@ mod symphonia_formats;
 mod wave;
 
 pub use ima4::decode_ima4;
+pub use symphonia_formats::{mp3_packets, PacketDecoder, QueueFormat};
 
 use crate::fs::{Fs, GuestPath};
 

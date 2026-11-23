@@ -9,16 +9,18 @@
 //! Apple's implementation probably uses Core Audio instead.
 
 use crate::abi::{CallFromHost, GuestFunction};
-use crate::audio::decode_ima4;
 use crate::audio::openal as al;
 use crate::audio::openal::al_types::*;
 use crate::audio::openal::{OpenAL, OpenALManager};
+use crate::audio::{decode_ima4, mp3_packets, PacketDecoder, QueueFormat};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::carbon_core::OSStatus;
 use crate::frameworks::core_audio_types::{
     debug_fourcc, fourcc, kAudioFormatAppleIMA4, kAudioFormatFlagIsBigEndian,
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
-    kAudioFormatLinearPCM, AudioStreamBasicDescription, AudioTimeStamp,
+    kAudioFormatLinearPCM, kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE,
+    kAudioFormatMPEG4AAC_HE_V2, kAudioFormatMPEGLayer3, kMPEG4Object_AAC_PS, kMPEG4Object_AAC_SBR,
+    AudioStreamBasicDescription, AudioStreamPacketDescription, AudioTimeStamp,
 };
 use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, CFRunLoopGetMain, CFRunLoopMode, CFRunLoopRef,
@@ -31,6 +33,8 @@ use crate::mem::{
 use crate::objc::msg;
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 #[derive(Default)]
 pub struct State {
@@ -76,6 +80,223 @@ struct AudioQueueHostObject {
     /// audio already handed to OpenAL plays out, then the queue is disposed
     /// of ([handle_audio_queue]). The app's callback is not called any more.
     disposing: bool,
+    /// n72 fork: compressed input (MP3, AAC) is decoded by this.
+    decoder: Option<QueueDecoder>,
+}
+
+/// n72 fork: compressed AudioQueue input, decoded on a thread of its own
+/// ("audio-queue-decode": the AMC through a context of the queue's own, or
+/// symphonia) as soon as a buffer is enqueued; the PCM is picked up in
+/// order when the buffer goes to OpenAL.
+struct QueueDecoder {
+    jobs: Option<mpsc::Sender<QueueJob>>,
+    results: mpsc::Receiver<QueueDecoded>,
+    thread: Option<JoinHandle<()>>,
+    /// Bumped by a reset: results of older jobs are dropped.
+    generation: u64,
+    /// Buffers sent and not yet picked up, in order.
+    in_flight: VecDeque<AudioQueueBufferRef>,
+    /// Vectors coming back, for the next jobs.
+    spare: Vec<Spare>,
+}
+
+/// A job's data, packets and PCM vectors, for reuse.
+type Spare = (Vec<u8>, Vec<(usize, usize)>, Vec<u8>);
+
+enum QueueJob {
+    Decode {
+        generation: u64,
+        data: Vec<u8>,
+        packets: Vec<(usize, usize)>,
+        pcm: Vec<u8>,
+    },
+    /// A fresh decoder state (and the magic cookie, if it changed).
+    Reset { cookie: Option<Vec<u8>> },
+}
+
+struct QueueDecoded {
+    generation: u64,
+    data: Vec<u8>,
+    packets: Vec<(usize, usize)>,
+    pcm: Vec<u8>,
+    rate: u32,
+    channels: u32,
+}
+
+/// The compressed formats an output queue takes (1 or 2 channels).
+fn compressed_format(format: &AudioStreamBasicDescription) -> Option<QueueFormat> {
+    let channels = format.channels_per_frame;
+    if !(1..=2).contains(&channels) {
+        return None;
+    }
+    match format.format_id {
+        kAudioFormatMPEGLayer3 => Some(QueueFormat::Mp3),
+        kAudioFormatMPEG4AAC => Some(QueueFormat::Aac {
+            he: match format.format_flags {
+                kMPEG4Object_AAC_SBR => Some(false),
+                kMPEG4Object_AAC_PS => Some(true),
+                _ => None,
+            },
+        }),
+        kAudioFormatMPEG4AAC_HE => Some(QueueFormat::Aac { he: Some(false) }),
+        kAudioFormatMPEG4AAC_HE_V2 => Some(QueueFormat::Aac { he: Some(true) }),
+        _ => None,
+    }
+}
+
+fn is_supported_queue_format(format: &AudioStreamBasicDescription) -> bool {
+    is_supported_audio_format(format) || compressed_format(format).is_some()
+}
+
+impl QueueDecoder {
+    fn new(format: QueueFormat, asbd: &AudioStreamBasicDescription) -> Option<QueueDecoder> {
+        let (jobs, job_rx) = mpsc::channel::<QueueJob>();
+        let (result_tx, results) = mpsc::channel();
+        let rate = asbd.sample_rate as u32;
+        let channels = asbd.channels_per_frame;
+        let thread = std::thread::Builder::new()
+            .name("audio-queue-decode".to_string())
+            .spawn(move || {
+                let mut decoder: Option<PacketDecoder> = None;
+                let mut cookie: Option<Vec<u8>> = None;
+                let mut failed = false;
+                // Which decoder: said once per queue, not after every reset.
+                let mut said = false;
+                for job in job_rx {
+                    match job {
+                        QueueJob::Reset { cookie: c } => {
+                            decoder = None;
+                            failed = false;
+                            if c.is_some() {
+                                cookie = c;
+                            }
+                        }
+                        QueueJob::Decode {
+                            generation,
+                            data,
+                            packets,
+                            mut pcm,
+                        } => {
+                            pcm.clear();
+                            if decoder.is_none() && !failed {
+                                if let Some(&(offset, size)) = packets.first() {
+                                    decoder = PacketDecoder::new(
+                                        format,
+                                        rate,
+                                        channels,
+                                        cookie.as_deref(),
+                                        &data[offset..offset + size],
+                                        !said,
+                                    );
+                                    said = true;
+                                    if decoder.is_none() {
+                                        log!(
+                                            "AudioQueue {:?}: cannot decode this stream (silence)",
+                                            format
+                                        );
+                                        failed = true;
+                                    }
+                                }
+                            }
+                            let (rate, channels) = match decoder.as_mut() {
+                                Some(d) => {
+                                    pcm.extend_from_slice(d.decode(&data, &packets));
+                                    (d.rate, d.channels)
+                                }
+                                None => (rate, channels),
+                            };
+                            let done = QueueDecoded {
+                                generation,
+                                data,
+                                packets,
+                                pcm,
+                                rate,
+                                channels,
+                            };
+                            if result_tx.send(done).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some(QueueDecoder {
+            jobs: Some(jobs),
+            results,
+            thread: Some(thread),
+            generation: 0,
+            in_flight: VecDeque::new(),
+            spare: Vec::new(),
+        })
+    }
+
+    fn send(&self, job: QueueJob) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(job);
+        }
+    }
+
+    /// Hand over an enqueued buffer's packets.
+    fn submit(&mut self, buffer: AudioQueueBufferRef, bytes: &[u8], packets: &[(usize, usize)]) {
+        let (mut data, mut p, pcm) = self.spare.pop().unwrap_or_default();
+        data.clear();
+        data.extend_from_slice(bytes);
+        p.clear();
+        p.extend_from_slice(packets);
+        self.send(QueueJob::Decode {
+            generation: self.generation,
+            data,
+            packets: p,
+            pcm,
+        });
+        self.in_flight.push_back(buffer);
+    }
+
+    /// The PCM of `buffer` (the oldest one sent), waiting for it if `wait`.
+    /// `(pcm, rate, channels)`; give `pcm` back with [QueueDecoder::recycle].
+    fn take(&mut self, buffer: AudioQueueBufferRef, wait: bool) -> Option<(Vec<u8>, u32, u32)> {
+        if self.in_flight.front() != Some(&buffer) {
+            // Not sent (enqueued before a reset?): nothing to play.
+            return Some((Vec::new(), 0, 0));
+        }
+        loop {
+            let done = if wait {
+                self.results.recv().ok()?
+            } else {
+                self.results.try_recv().ok()?
+            };
+            if done.generation != self.generation {
+                self.spare.push((done.data, done.packets, done.pcm));
+                continue;
+            }
+            self.in_flight.pop_front();
+            self.spare.push((done.data, done.packets, Vec::new()));
+            return Some((done.pcm, done.rate, done.channels));
+        }
+    }
+
+    fn recycle(&mut self, pcm: Vec<u8>) {
+        if let Some(slot) = self.spare.iter_mut().find(|s| s.2.capacity() == 0) {
+            slot.2 = pcm;
+        }
+    }
+
+    /// A fresh decoder state; what was sent before is dropped.
+    fn reset(&mut self, cookie: Option<Vec<u8>>) {
+        self.generation += 1;
+        self.in_flight.clear();
+        self.send(QueueJob::Reset { cookie });
+    }
+}
+
+impl Drop for QueueDecoder {
+    fn drop(&mut self) {
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Track whether the audio queue is meant to be running, in order to handle
@@ -104,10 +325,8 @@ pub struct AudioQueueBuffer {
     pub audio_data_byte_size: u32,
     user_data: MutVoidPtr,
     packet_description_capacity: u32,
-    /// Should be a `MutPtr<AudioStreamPacketDescription>`, but that's not
-    /// implemented yet.
-    _packet_descriptions: MutVoidPtr,
-    _packet_description_count: u32,
+    packet_descriptions: MutPtr<AudioStreamPacketDescription>,
+    packet_description_count: u32,
 }
 unsafe impl SafeRead for AudioQueueBuffer {}
 
@@ -123,6 +342,7 @@ type AudioQueueParameterValue = f32;
 
 pub type AudioQueuePropertyID = u32;
 pub const kAudioQueueProperty_IsRunning: AudioQueuePropertyID = fourcc(b"aqrn");
+pub const kAudioQueueProperty_MagicCookie: AudioQueuePropertyID = fourcc(b"aqmc");
 
 /// (*void)(void *in_user_data, AudioQueueRef in_aq, AudioQueuePropertyID in_id)
 type AudioQueuePropertyListenerProc = GuestFunction;
@@ -195,6 +415,7 @@ pub fn AudioQueueNewOutput(
         aq_is_running_user_data: None,
         is_running_handler: false,
         disposing: false,
+        decoder: compressed_format(&format).and_then(|f| QueueDecoder::new(f, &format)),
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -207,7 +428,7 @@ pub fn AudioQueueNewOutput(
 
     log_if_broken_audio_format(&format);
 
-    if !is_supported_audio_format(&format) {
+    if !is_supported_queue_format(&format) {
         log_dbg!("Warning: Audio queue {:?} will be ignored because its format is not yet supported: {:#?}", aq_ref, format);
     }
 
@@ -281,11 +502,35 @@ fn AudioQueueAllocateBufferWithPacketDescriptions(
     env: &mut Environment,
     in_aq: AudioQueueRef,
     in_buffer_byte_size: GuestUSize,
-    _in_number_packet_desc: GuestUSize,
+    in_number_packet_desc: GuestUSize,
     out_buffer: MutPtr<AudioQueueBufferRef>,
 ) -> OSStatus {
-    // TODO: support packet descriptions
-    AudioQueueAllocateBuffer(env, in_aq, in_buffer_byte_size, out_buffer)
+    let status = AudioQueueAllocateBuffer(env, in_aq, in_buffer_byte_size, out_buffer);
+    if status != 0 || in_number_packet_desc == 0 {
+        return status;
+    }
+    // The buffer's own array, which the app may fill instead of passing one
+    // to AudioQueueEnqueueBuffer.
+    let buffer_ptr = env.mem.read(out_buffer);
+    let descriptions: MutPtr<AudioStreamPacketDescription> = env
+        .mem
+        .alloc(in_number_packet_desc * guest_size_of::<AudioStreamPacketDescription>())
+        .cast();
+    let mut buffer = env.mem.read(buffer_ptr);
+    buffer.packet_description_capacity = in_number_packet_desc;
+    buffer.packet_descriptions = descriptions;
+    env.mem.write(buffer_ptr, buffer);
+    0 // success
+}
+
+/// Free a buffer's memory (and its packet descriptions).
+fn free_buffer_memory(mem: &mut Mem, buffer_ptr: AudioQueueBufferRef) {
+    let buffer = mem.read(buffer_ptr);
+    mem.free(buffer.audio_data);
+    if !buffer.packet_descriptions.is_null() {
+        mem.free(buffer.packet_descriptions.cast());
+    }
+    mem.free(buffer_ptr.cast());
 }
 
 pub fn AudioQueueAllocateBuffer(
@@ -319,8 +564,8 @@ pub fn AudioQueueAllocateBuffer(
         audio_data_byte_size: 0,
         user_data: Ptr::null(),
         packet_description_capacity,
-        _packet_descriptions: Ptr::null(),
-        _packet_description_count: 0,
+        packet_descriptions: Ptr::null(),
+        packet_description_count: 0,
     });
     host_object.buffers.push(buffer_ptr);
     env.mem.write(out_buffer, buffer_ptr);
@@ -355,14 +600,14 @@ pub fn AudioQueueEnqueueBuffer(
     env: &mut Environment,
     in_aq: AudioQueueRef,
     in_buffer: AudioQueueBufferRef,
-    _in_num_packet_descs: u32,
-    _in_packet_descs: MutVoidPtr,
+    in_num_packet_descs: u32,
+    in_packet_descs: MutVoidPtr,
 ) -> OSStatus {
     return_if_null!(in_aq);
 
-    // Variable packet size unimplemented (no formats supported that need it).
-    // We don't assert the count is 0 because we might get a useless one even
-    // for formats that don't need it.
+    // The packet descriptions matter for the compressed formats only. We
+    // don't assert the count is 0 otherwise because we might get a useless
+    // one even for formats that don't need it.
 
     let host_object = State::get(&mut env.framework_state)
         .audio_queues
@@ -371,6 +616,57 @@ pub fn AudioQueueEnqueueBuffer(
 
     if !host_object.buffers.contains(&in_buffer) {
         return kAudioQueueErr_InvalidBuffer;
+    }
+
+    if let Some(decoder) = host_object.decoder.as_mut() {
+        let buffer = env.mem.read(in_buffer);
+        let size = buffer
+            .audio_data_byte_size
+            .min(buffer.audio_data_bytes_capacity);
+        let bytes = env.mem.bytes_at(buffer.audio_data.cast(), size);
+        // The descriptions passed, else the buffer's own.
+        let (descs, count): (MutPtr<AudioStreamPacketDescription>, u32) =
+            if !in_packet_descs.is_null() && in_num_packet_descs != 0 {
+                (in_packet_descs.cast(), in_num_packet_descs)
+            } else {
+                (
+                    buffer.packet_descriptions,
+                    buffer
+                        .packet_description_count
+                        .min(buffer.packet_description_capacity),
+                )
+            };
+        let mut packets = Vec::with_capacity(count as usize);
+        if !descs.is_null() {
+            for i in 0..count {
+                let AudioStreamPacketDescription {
+                    start_offset,
+                    data_byte_size,
+                    ..
+                } = env.mem.read(descs + i);
+                // Packets must lie in the buffer.
+                if let Ok(start) = usize::try_from(start_offset) {
+                    let size = data_byte_size as usize;
+                    if start
+                        .checked_add(size)
+                        .is_some_and(|end| end <= bytes.len())
+                    {
+                        packets.push((start, size));
+                    }
+                }
+            }
+        }
+        if packets.is_empty() && host_object.format.format_id == kAudioFormatMPEGLayer3 {
+            // MP3 without descriptions: the frames are self-delimiting.
+            packets = mp3_packets(bytes);
+        }
+        if packets.is_empty() && size != 0 {
+            log_dbg!(
+                "Compressed buffer {:?} without packet descriptions: silence",
+                in_buffer
+            );
+        }
+        decoder.submit(in_buffer, bytes, &packets);
     }
 
     host_object.buffer_queue.push_back(in_buffer);
@@ -491,12 +787,30 @@ fn AudioQueueGetProperty(
 }
 
 fn AudioQueueSetProperty(
-    _env: &mut Environment,
+    env: &mut Environment,
     in_aq: AudioQueueRef,
     in_property_id: AudioQueuePropertyID,
     in_property_data: ConstVoidPtr,
-    io_data_size: MutPtr<u32>,
+    io_data_size: GuestUSize,
 ) -> OSStatus {
+    return_if_null!(in_aq);
+    if in_property_id == kAudioQueueProperty_MagicCookie && !in_property_data.is_null() {
+        // n72 fork: the AAC decoder's configuration (an 'esds' or the bare
+        // AudioSpecificConfig).
+        let cookie = env
+            .mem
+            .bytes_at(in_property_data.cast(), io_data_size)
+            .to_vec();
+        let host_object = State::get(&mut env.framework_state)
+            .audio_queues
+            .get_mut(&in_aq)
+            .unwrap();
+        if let Some(decoder) = host_object.decoder.as_mut() {
+            // Before the first buffer, as it should be: nothing is lost.
+            decoder.reset(Some(cookie));
+        }
+        return 0; // success
+    }
     log!(
         "TODO: AudioQueueSetProperty({:?}, {}, {:?}, {:?}) -> kAudioQueueErr_InvalidDevice",
         in_aq,
@@ -683,13 +997,17 @@ pub fn decode_buffer(
 
 /// Ensure an audio queue has an OpenAL source and at least one queued OpenAL
 /// buffer.
-fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) -> Result<(), ()> {
+/// `wait`: block for compressed buffers still being decoded (otherwise only
+/// when OpenAL has nothing left to play).
+fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef, wait: bool) -> Result<(), ()> {
     let (state, context) =
         State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
 
     let host_object = state.audio_queues.get_mut(&in_aq).unwrap();
 
-    if !is_supported_audio_format(&host_object.format) {
+    if !is_supported_queue_format(&host_object.format)
+        || (host_object.decoder.is_none() && compressed_format(&host_object.format).is_some())
+    {
         return Err(());
     }
 
@@ -733,6 +1051,48 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) -> Result<(), 
 
         let next_buffer_idx = al_buffers_queued;
         let next_buffer_ref = host_object.buffer_queue[next_buffer_idx];
+
+        if let Some(decoder) = host_object.decoder.as_mut() {
+            // Compressed: the decoder thread's PCM. Wait for it only if
+            // OpenAL would run dry (or when priming or starting).
+            let Some((pcm, rate, channels)) =
+                decoder.take(next_buffer_ref, wait || unprocessed_buffers == 0)
+            else {
+                break;
+            };
+            let next_al_buffer = host_object.al_unused_buffers.pop().unwrap_or_else(|| {
+                let mut al_buffer = 0;
+                unsafe { context.GenBuffers(1, &mut al_buffer) };
+                assert!(unsafe { context.GetError() } == 0);
+                al_buffer
+            });
+            let (al_format, frame) = if channels == 1 {
+                (al::AL_FORMAT_MONO16, [0u8; 2].as_slice())
+            } else {
+                (al::AL_FORMAT_STEREO16, [0u8; 4].as_slice())
+            };
+            // Nothing decoded: a frame of silence (keeps the queues in step).
+            let data = if pcm.is_empty() { frame } else { &pcm[..] };
+            let rate = if rate == 0 {
+                host_object.format.sample_rate as ALsizei
+            } else {
+                rate as ALsizei
+            };
+            unsafe {
+                context.BufferData(
+                    next_al_buffer,
+                    al_format,
+                    data.as_ptr() as *const ALvoid,
+                    data.len().try_into().unwrap(),
+                    rate,
+                );
+                context.SourceQueueBuffers(al_source, 1, &next_al_buffer);
+            }
+            assert!(unsafe { context.GetError() } == 0);
+            decoder.recycle(pcm);
+            continue;
+        }
+
         let next_buffer = env.mem.read(next_buffer_ref);
 
         log_dbg!(
@@ -807,7 +1167,7 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     let Some(al_source) = host_object.al_source else {
         return;
     };
-    if !is_supported_audio_format(&host_object.format) {
+    if !is_supported_queue_format(&host_object.format) {
         return;
     }
     if host_object.is_running_handler {
@@ -860,7 +1220,7 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
     // Push new buffers etc.
 
-    _ = prime_audio_queue(env, in_aq);
+    _ = prime_audio_queue(env, in_aq, false);
 
     let context = env
         .framework_state
@@ -918,7 +1278,7 @@ fn AudioQueuePrime(
 ) -> OSStatus {
     return_if_null!(in_aq);
 
-    match prime_audio_queue(env, in_aq) {
+    match prime_audio_queue(env, in_aq, true) {
         Ok(_) => {
             assert!(out_number_of_frames_prepared.is_null()); // TODO
             0 // success
@@ -956,7 +1316,8 @@ pub fn AudioQueueStart(
 
     assert!(in_device_start_time.is_null()); // TODO
 
-    _ = prime_audio_queue(env, in_aq);
+    // (Compressed buffers: waits for the first one only.)
+    _ = prime_audio_queue(env, in_aq, false);
 
     let (state, context) =
         State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
@@ -965,8 +1326,10 @@ pub fn AudioQueueStart(
 
     host_object.is_running = AudioQueueIsRunning::Running;
 
-    if is_supported_audio_format(&host_object.format) {
-        let al_source = host_object.al_source.unwrap();
+    if let Some(al_source) = host_object
+        .al_source
+        .filter(|_| is_supported_queue_format(&host_object.format))
+    {
         unsafe { context.SourcePlay(al_source) };
         assert!(unsafe { context.GetError() } == 0);
     } else {
@@ -1075,6 +1438,10 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
     }
 
     host_object.buffer_queue.clear();
+    // "Resets the audio queue's decoder state."
+    if let Some(decoder) = host_object.decoder.as_mut() {
+        decoder.reset(None);
+    }
 
     0 // success
 }
@@ -1106,9 +1473,7 @@ fn AudioQueueFreeBuffer(
 
         log_dbg!("Freeing buffer: {:?}", in_buffer);
 
-        let buffer = env.mem.read(in_buffer);
-        env.mem.free(buffer.audio_data);
-        env.mem.free(in_buffer.cast());
+        free_buffer_memory(&mut env.mem, in_buffer);
 
         0 // success
     } else {
@@ -1166,10 +1531,8 @@ fn dispose_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
     env.mem.free(in_aq.cast());
 
-    for buffer_ptr in host_object.buffers {
-        let buffer = env.mem.read(buffer_ptr);
-        env.mem.free(buffer.audio_data);
-        env.mem.free(buffer_ptr.cast());
+    for &buffer_ptr in &host_object.buffers {
+        free_buffer_memory(&mut env.mem, buffer_ptr);
     }
 
     if let Some(al_source) = host_object.al_source {

@@ -164,6 +164,25 @@ unsafe impl SafeRead for AudioTimeStamp {}
 pub type AudioFormatID = u32;
 pub const kAudioFormatLinearPCM: AudioFormatID = fourcc(b"lpcm");
 pub const kAudioFormatAppleIMA4: AudioFormatID = fourcc(b"ima4");
+pub const kAudioFormatMPEGLayer3: AudioFormatID = fourcc(b".mp3");
+pub const kAudioFormatMPEG4AAC: AudioFormatID = fourcc(b"aac ");
+pub const kAudioFormatMPEG4AAC_HE: AudioFormatID = fourcc(b"aach");
+pub const kAudioFormatMPEG4AAC_HE_V2: AudioFormatID = fourcc(b"aacp");
+
+/// `kMPEG4Object_AAC_SBR`, `kMPEG4Object_AAC_PS`: the object type in the
+/// format flags of `kAudioFormatMPEG4AAC`.
+pub const kMPEG4Object_AAC_SBR: AudioFormatFlags = 5;
+pub const kMPEG4Object_AAC_PS: AudioFormatFlags = 29;
+
+/// One packet of a buffer in a variable-packet-size format.
+#[derive(Copy, Clone, Debug)]
+#[repr(C, packed)]
+pub struct AudioStreamPacketDescription {
+    pub start_offset: i64,
+    pub variable_frames_in_packet: u32,
+    pub data_byte_size: u32,
+}
+unsafe impl SafeRead for AudioStreamPacketDescription {}
 
 pub type AudioFormatFlags = u32;
 pub const kAudioFormatFlagIsFloat: AudioFormatFlags = 1 << 0;
