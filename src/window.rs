@@ -275,6 +275,13 @@ pub struct Window {
     /// certain SDL functions (that call JNI functions) are on the main
     /// stack on Android.
     pub(super) on_main_stack: bool,
+    /// n72 fork: the display is lent to the movie player (see
+    /// [Self::n72_lend_display]); nothing is presented meanwhile.
+    #[cfg(feature = "cpu-native")]
+    n72_display_lent: bool,
+    /// n72 fork: when the app last presented while the display was lent.
+    #[cfg(feature = "cpu-native")]
+    n72_last_lent_swap: std::cell::Cell<Instant>,
 }
 
 impl Window {
@@ -291,9 +298,6 @@ impl Window {
     /// framebuffer is shown unrotated (see [Self::rotation_matrix]).
     pub fn fixed_portrait_panel() -> bool {
         cfg!(feature = "cpu-native")
-    }
-    pub fn scale_hack(&self) -> NonZeroU32 {
-        self.scale_hack
     }
     pub fn new(
         title: &str,
@@ -449,6 +453,10 @@ impl Window {
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
             on_main_stack: true,
+            #[cfg(feature = "cpu-native")]
+            n72_display_lent: false,
+            #[cfg(feature = "cpu-native")]
+            n72_last_lent_swap: std::cell::Cell::new(Instant::now()),
         };
 
         // Set up OpenGL ES context used for splash screen and app UI rendering
@@ -1361,7 +1369,69 @@ impl Window {
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
     pub fn swap_window(&self) {
+        // n72 fork: while the movie player has the display, the app's frames
+        // are not shown (a page flip would fail: touchHLE is not the KMS
+        // master then), and an app that keeps drawing is held to 30 frames a
+        // second, so that it leaves the CPU to the player.
+        #[cfg(feature = "cpu-native")]
+        if self.n72_display_lent {
+            let next = self.n72_last_lent_swap.get() + Duration::from_millis(33);
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            }
+            self.n72_last_lent_swap.set(Instant::now());
+            return;
+        }
         self.window.gl_swap_window();
+    }
+
+    /// n72 fork: lend the display to another process (`true`) or take it
+    /// back (`false`). The movie player (n72-player) shows its pictures on
+    /// the video plane of the layer 0 KMS device, which SDL holds as master;
+    /// setting a plane needs master, and a process opening the device only
+    /// becomes master if there is none. So touchHLE drops master on SDL's DRM
+    /// file before the player starts and sets it again after the player has
+    /// exited (its file closed, its plane off). The primary plane keeps the
+    /// app's last frame meanwhile, under the video plane, and shows it again
+    /// afterwards. Returns whether the change of master worked.
+    #[cfg(feature = "cpu-native")]
+    pub fn n72_lend_display(&mut self, lend: bool) -> bool {
+        if lend == self.n72_display_lent {
+            return true;
+        }
+        // (taking it back: presented again whatever happens below)
+        self.n72_display_lent = false;
+        // SDL_SysWMinfo's kmsdrm member (SDL 2.0.15 and later): int
+        // dev_index; int drm_fd; struct gbm_device *gbm_dev. The bindings
+        // only have the union's padding for it.
+        let fd = unsafe {
+            let mut info: sdl2_sys::SDL_SysWMinfo = std::mem::zeroed();
+            info.version.major = sdl2_sys::SDL_MAJOR_VERSION as u8;
+            info.version.minor = sdl2_sys::SDL_MINOR_VERSION as u8;
+            info.version.patch = sdl2_sys::SDL_PATCHLEVEL as u8;
+            if sdl2_sys::SDL_GetWindowWMInfo(self.window.raw(), &mut info)
+                != sdl2_sys::SDL_bool::SDL_TRUE
+                || info.subsystem != sdl2_sys::SDL_SYSWM_TYPE::SDL_SYSWM_KMSDRM
+            {
+                log!("n72: no KMS/DRM window, the display cannot be lent");
+                return false;
+            }
+            i32::from_ne_bytes(info.info.dummy[4..8].try_into().unwrap())
+        };
+        // DRM_IOCTL_SET_MASTER / DRM_IOCTL_DROP_MASTER: _IO('d', 0x1e / 0x1f)
+        let request: libc::c_ulong = if lend { 0x641f } else { 0x641e };
+        if unsafe { libc::ioctl(fd, request as _) } != 0 {
+            log!(
+                "n72: {} KMS master failed: {}",
+                if lend { "dropping" } else { "taking back" },
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        self.n72_display_lent = lend;
+        self.n72_last_lent_swap.set(Instant::now());
+        true
     }
 
     /// Consider the emulated device to be rotated to a particular orientation.

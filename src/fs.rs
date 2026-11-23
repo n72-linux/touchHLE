@@ -942,6 +942,20 @@ impl Fs {
         Ok(paths)
     }
 
+    /// n72 fork: the host path of a guest file that is a plain host file (not
+    /// one inside an `.ipa` or a resource bundled with touchHLE), for handing
+    /// it to another program (the movie player).
+    #[cfg(feature = "cpu-native")]
+    pub fn host_file_path(&self, path: &GuestPath) -> Option<&Path> {
+        match self.lookup_node(path)? {
+            FsNode::File {
+                location: FileLocation::Path(host_path),
+                ..
+            } => Some(host_path),
+            _ => None,
+        }
+    }
+
     /// Like [std::fs::read] but for the guest filesystem.
     pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
         let mut file = self.open(path.as_ref())?;
