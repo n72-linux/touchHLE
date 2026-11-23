@@ -49,6 +49,12 @@ steps can name any file copied into the .app.
 
 ## Expected log
 
+touchHLE first warns about `dyld_stub_binder` ("unhandled external
+relocation" and "unhandled non-lazy symbol"). That is harmless: every app
+linked for iOS 3.1+ imports it, and touchHLE replaces the stubs that would
+use it. The first step starts 3 s after launch, so the green window shows
+first.
+
     N72MediaTest[...] N72MediaTest: launched
     N72MediaTest[...] N72MediaTest: 2 step(s) in test.txt
     N72MediaTest[...] N72MediaTest: movie Cut1.mov start
