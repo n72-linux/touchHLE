@@ -82,6 +82,9 @@ struct AudioQueueHostObject {
     disposing: bool,
     /// n72 fork: compressed input (MP3, AAC) is decoded by this.
     decoder: Option<QueueDecoder>,
+    /// n72 fork: the OpenAL format and rate of the compressed buffers on the
+    /// source since it was last emptied (OpenAL takes no mix on a queue).
+    al_format: Option<(ALenum, ALsizei)>,
 }
 
 /// n72 fork: compressed AudioQueue input, decoded on a thread of its own
@@ -416,6 +419,7 @@ pub fn AudioQueueNewOutput(
         is_running_handler: false,
         disposing: false,
         decoder: compressed_format(&format).and_then(|f| QueueDecoder::new(f, &format)),
+        al_format: None,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -1066,17 +1070,42 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef, wait: bool) ->
                 assert!(unsafe { context.GetError() } == 0);
                 al_buffer
             });
-            let (al_format, frame) = if channels == 1 {
-                (al::AL_FORMAT_MONO16, [0u8; 2].as_slice())
-            } else {
-                (al::AL_FORMAT_STEREO16, [0u8; 4].as_slice())
-            };
-            // Nothing decoded: a frame of silence (keeps the queues in step).
-            let data = if pcm.is_empty() { frame } else { &pcm[..] };
-            let rate = if rate == 0 {
-                host_object.format.sample_rate as ALsizei
-            } else {
-                rate as ALsizei
+            let decoded = (!pcm.is_empty() && channels != 0).then_some((
+                if channels == 1 {
+                    al::AL_FORMAT_MONO16
+                } else {
+                    al::AL_FORMAT_STEREO16
+                },
+                rate as ALsizei,
+            ));
+            // The source's format: the first buffer's (silence: the ASBD's).
+            let (al_format, rate) = *host_object.al_format.get_or_insert(decoded.unwrap_or((
+                if host_object.format.channels_per_frame == 1 {
+                    al::AL_FORMAT_MONO16
+                } else {
+                    al::AL_FORMAT_STEREO16
+                },
+                host_object.format.sample_rate as ALsizei,
+            )));
+            let silence = [0u8; 4];
+            let data = match decoded {
+                Some(f) if f == (al_format, rate) => &pcm[..],
+                other => {
+                    if other.is_some() {
+                        log!(
+                            "AudioQueue {:?}: the stream changed format ({:?}): silence",
+                            in_aq,
+                            other
+                        );
+                    }
+                    // Nothing (usable) decoded: a frame of silence, keeping
+                    // the queues in step.
+                    if al_format == al::AL_FORMAT_MONO16 {
+                        &silence[..2]
+                    } else {
+                        &silence[..]
+                    }
+                }
             };
             unsafe {
                 context.BufferData(
@@ -1442,6 +1471,8 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
     if let Some(decoder) = host_object.decoder.as_mut() {
         decoder.reset(None);
     }
+    // The source is empty: the next stream may have another format.
+    host_object.al_format = None;
 
     0 // success
 }
