@@ -393,17 +393,166 @@ fn spec_from_first_packet(data: &SharedBytes) -> Result<(u32, u32), ()> {
     Err(())
 }
 
-pub fn decode_symphonia_to_pcm(bytes: Vec<u8>) -> Result<SymphoniaDecodedToPcm, ()> {
-    let data = SharedBytes(Arc::new(bytes));
-
-    // The exact length without decoding: a demux-only pass.
-    let (mut reader, track_id, params) = open_reader(&data)?;
-    let is_mp3 = params.codec == CODEC_ID_MP3;
+/// The PCM frames of the track: a demux-only pass through symphonia.
+fn frames_by_demuxing(data: &SharedBytes, is_mp3: bool) -> Result<u64, ()> {
+    let (mut reader, track_id, _) = open_reader(data)?;
     let mut frames: u64 = 0;
     while let Some(packet) = next_packet(&mut *reader, track_id)? {
         frames += packet_frames(&packet, is_mp3);
     }
-    drop(reader);
+    Ok(frames)
+}
+
+/// The PCM frames of an MP3 track as [frames_by_demuxing] counts them, from
+/// the frame headers alone: the same frames as symphonia 0.6.0's MP3
+/// demuxer (`read_mpeg_frame`: `sync_frame`, `parse_frame_header`, a frame
+/// cut by the end of the file ends the stream) and the same trims as its
+/// packets (`trimmed_dur`: the LAME delay as negative timestamps, the track's
+/// frame count as the end). Layer I/II headers count too (junk can look like
+/// one; the decoder turns them into silence). `None` for what this does not
+/// mirror (a Xing/Info/VBRI tag after the first frame, which the demuxer
+/// may drop): the demux pass then counts.
+fn mp3_frames_by_hopping(reader: Box<dyn FormatReader>, bytes: &[u8]) -> Option<u64> {
+    use symphonia::core::io::ReadBytes;
+
+    let track = reader.tracks().first()?;
+    let delay = u64::from(track.delay.unwrap_or(0));
+    let end = track.num_frames;
+    // Where the demuxer's first packet starts (after an ID3v2 tag and the
+    // Info frame, which the probe and the reader have read).
+    let mut p = usize::try_from(reader.into_inner().pos()).ok()?;
+
+    // Stream position (in frames) of the next frame's start, plus `delay`.
+    let mut at: u64 = 0;
+    let mut frames: u64 = 0;
+    loop {
+        // sync_frame
+        let mut sync = 0u32;
+        loop {
+            while sync & 0xffe0_0000 != 0xffe0_0000 {
+                let Some(&b) = bytes.get(p) else {
+                    return Some(frames);
+                };
+                sync = (sync << 8) | u32::from(b);
+                p += 1;
+            }
+            let valid = (sync >> 19) & 3 != 1
+                && (sync >> 17) & 3 != 0
+                && (sync >> 12) & 0xf != 0xf
+                && (sync >> 10) & 3 != 3;
+            if valid {
+                break;
+            }
+            let Some(&b) = bytes.get(p) else {
+                return Some(frames);
+            };
+            sync = (sync << 8) | u32::from(b);
+            p += 1;
+        }
+        // parse_frame_header
+        let mpeg1 = (sync >> 19) & 3 == 3;
+        // 3: Layer I, 2: Layer II, 1: Layer III
+        let layer = (sync >> 17) & 3;
+        let bitrate_idx = ((sync >> 12) & 0xf) as usize;
+        if bitrate_idx == 0 {
+            // Free bit-rate: not supported, the demuxer syncs on after it.
+            continue;
+        }
+        let kbps: [u32; 15] = match (mpeg1, layer) {
+            (true, 3) => [
+                0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+            ],
+            (true, 2) => [
+                0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+            ],
+            (true, _) => [
+                0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ],
+            (false, 3) => [
+                0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+            ],
+            (false, _) => [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+        };
+        let bitrate = 1000 * kbps[bitrate_idx];
+        let mono = (sync >> 6) & 3 == 3;
+        if layer == 2 {
+            // Layer II channel mode and bit-rate combinations not allowed.
+            let bad = if mono {
+                [224_000, 256_000, 320_000, 384_000].contains(&bitrate)
+            } else {
+                [32_000, 48_000, 56_000, 80_000].contains(&bitrate)
+            };
+            if bad {
+                continue;
+            }
+        }
+        let rate = [44_100, 48_000, 32_000][((sync >> 10) & 3) as usize]
+            >> match (sync >> 19) & 3 {
+                3 => 0,
+                2 => 1,
+                _ => 2,
+            };
+        let padding = (sync >> 9) & 1;
+        let frame_len = match layer {
+            3 => (12 * bitrate / rate + padding) * 4,
+            1 if !mpeg1 => 72 * bitrate / rate + padding,
+            _ => 144 * bitrate / rate + padding,
+        } as usize;
+        let body = frame_len.checked_sub(4)?;
+        let start = p - 4;
+        if p + body > bytes.len() {
+            // read_buf_exact fails: the stream has ended.
+            return Some(frames);
+        }
+        let frame = &bytes[start..p + body];
+        // A Xing/Info/VBRI tag here would be dropped by the demuxer after
+        // a closer look: leave that to it.
+        let side_info = match (mpeg1, mono) {
+            (true, true) => 17,
+            (true, false) => 32,
+            (false, true) => 9,
+            (false, false) => 17,
+        };
+        let tag_id = |at: usize| frame.get(at..at + 4);
+        if matches!(tag_id(4 + side_info), Some(b"Xing" | b"Info")) || tag_id(36) == Some(b"VBRI") {
+            return None;
+        }
+        p += body;
+
+        // trimmed_dur, then the decoder's trim (end, then start)
+        let block: u64 = match layer {
+            3 => 384,
+            2 => 1152,
+            _ if mpeg1 => 1152,
+            _ => 576,
+        };
+        let trim_start = delay.saturating_sub(at).min(block);
+        let trim_end = match end {
+            Some(end) => (at + block).saturating_sub(delay).saturating_sub(end),
+            None => 0,
+        };
+        frames += block.saturating_sub(trim_end).saturating_sub(trim_start);
+        at += block;
+    }
+}
+
+pub fn decode_symphonia_to_pcm(bytes: Vec<u8>) -> Result<SymphoniaDecodedToPcm, ()> {
+    let data = SharedBytes(Arc::new(bytes));
+
+    // The exact length without decoding: MP3 by hopping over the frame
+    // headers, the rest (or MP3 the hop does not understand) by a demux-only
+    // pass.
+    let (reader, track_id, params) = open_reader(&data)?;
+    let is_mp3 = params.codec == CODEC_ID_MP3;
+    let hopped = if is_mp3 {
+        mp3_frames_by_hopping(reader, &data.0)
+    } else {
+        None
+    };
+    let frames = match hopped {
+        Some(frames) => frames,
+        None => frames_by_demuxing(&data, is_mp3)?,
+    };
     if frames == 0 {
         return Err(());
     }
@@ -1075,6 +1224,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         if ran == 0 {
             eprintln!("lame/ffmpeg not found: nothing tested");
+        }
+    }
+
+    /// The header hop counts what the demux pass counts.
+    #[test]
+    fn mp3_hop_matches_demux() {
+        let dir = std::env::temp_dir().join(format!("touchhle-audio-hop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ran = 0;
+        for (rate, channels) in [(44100, 2), (22050, 1), (22050, 2)] {
+            let wav = dir.join(format!("in-{rate}-{channels}.wav"));
+            write_wav(&wav, rate, channels, rate * 7 + 321);
+            let wav_s = wav.to_str().unwrap();
+            let variants: [(&str, &[&str]); 5] = [
+                ("cbr", &["-b", "128", "--cbr"]),
+                ("vbr", &["-V", "4"]),
+                ("vbr-notag", &["-t", "-V", "4"]),
+                ("cbr-notag", &["-t", "-b", "64", "--cbr"]),
+                (
+                    "id3v2",
+                    &["--id3v2-only", "--tt", "Title", "--ta", "Artist"],
+                ),
+            ];
+            for (name, opts) in variants {
+                let mp3 = dir.join(format!("{name}-{rate}-{channels}.mp3"));
+                let mut args = vec!["--quiet"];
+                args.extend_from_slice(opts);
+                args.extend([wav_s, mp3.to_str().unwrap()]);
+                let Some(mut bytes) = encode("lame", &args, &mp3) else {
+                    continue;
+                };
+                for junk in [false, true] {
+                    if junk {
+                        // An ID3v1 tag and junk with sync-like bytes.
+                        bytes.extend_from_slice(b"TAG");
+                        bytes.resize(bytes.len() + 125, b' ');
+                        let mut x = 0x1234_5678u32;
+                        for i in 0..3000 {
+                            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            bytes.push(if i % 97 == 0 { 0xff } else { (x >> 16) as u8 });
+                        }
+                    }
+                    let data = SharedBytes(Arc::new(bytes.clone()));
+                    let demuxed = frames_by_demuxing(&data, true).unwrap();
+                    let (reader, _, _) = open_reader(&data).unwrap();
+                    let hopped = mp3_frames_by_hopping(reader, &bytes);
+                    assert_eq!(
+                        hopped,
+                        Some(demuxed),
+                        "{name} {rate} {channels} junk {junk}"
+                    );
+                    ran += 1;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if ran == 0 {
+            eprintln!("lame not found: nothing tested");
         }
     }
 
