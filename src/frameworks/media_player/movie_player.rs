@@ -349,7 +349,7 @@ mod n72 {
         UIDeviceOrientation, UIDeviceOrientationLandscapeLeft, UIDeviceOrientationLandscapeRight,
         UIDeviceOrientationPortrait,
     };
-    use crate::objc::id;
+    use crate::objc::{id, nil};
     use crate::window::DeviceOrientation;
     use crate::Environment;
     use std::os::unix::process::CommandExt;
@@ -395,6 +395,9 @@ mod n72 {
             .objc
             .borrow::<super::MPMoviePlayerControllerHostObject>(player);
         let (url, orientation) = (host.content_url, host.orientation);
+        if url == nil {
+            return false;
+        }
         let guest_path = ns_url::to_rust_path(env, url);
         let Some(path) = env
             .fs
