@@ -14,6 +14,7 @@
 
 #[cfg(all(target_os = "linux", target_arch = "arm"))]
 mod amc;
+mod halfband;
 mod ima4;
 pub mod openal;
 mod symphonia_formats;

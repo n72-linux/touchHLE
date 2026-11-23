@@ -15,6 +15,7 @@
 //! and reads wait for the part they need. On the n72 (iPod touch 2G under Linux) MP3 goes to
 //! the AMC audio coprocessor, see [super::amc].
 
+use super::halfband::HalfBand;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -572,11 +573,12 @@ pub(super) struct Soft {
     out: Vec<u8>,
     pub rate: u32,
     pub channels: u32,
-    /// HE-AAC's core: rate and channels the decoder gives, upsampled 2x
-    /// (linear) and mono doubled to stereo (PS).
+    /// HE-AAC's core: rate and channels the decoder gives, upsampled 2x and
+    /// mono doubled to stereo (PS).
     core: Option<(u32, u32)>,
-    /// The last core frame (interpolation across packets).
-    last: [i16; 2],
+    /// The core's 2x interpolator.
+    up: Option<HalfBand>,
+    up_buf: Vec<u8>,
 }
 
 impl Soft {
@@ -598,7 +600,8 @@ impl Soft {
             rate,
             channels,
             core,
-            last: [0; 2],
+            up: core.map(|(_, ch)| HalfBand::new(ch as usize)),
+            up_buf: Vec::new(),
         }
     }
 
@@ -614,7 +617,9 @@ impl Soft {
                 self.decoder = Some(decoder);
             }
         }
-        self.last = [0; 2];
+        if let Some(up) = &mut self.up {
+            up.reset();
+        }
     }
 
     /// The packet's PCM, or `None` if it does not decode (to the stream's
@@ -633,32 +638,23 @@ impl Soft {
         }
         self.buf.clear();
         decoded.copy_bytes_to_vec_interleaved_as::<i16>(&mut self.buf);
-        if self.core.is_none() {
+        let Some(up) = &mut self.up else {
             return Some(&self.buf);
-        }
-        // HE-AAC core: twice the frames, by linear interpolation; mono to
-        // both channels for PS.
-        let (ci, co) = (channels as usize, self.channels as usize);
-        self.out.clear();
-        self.out.reserve(self.buf.len() * 2 * co / ci);
-        for frame in self.buf.chunks_exact(2 * ci) {
-            let mut now = [0i16; 2];
-            for (c, s) in now.iter_mut().enumerate().take(ci) {
-                *s = i16::from_le_bytes([frame[2 * c], frame[2 * c + 1]]);
+        };
+        // HE-AAC core: twice the frames through the half-band interpolator;
+        // mono to both channels for PS.
+        if channels == self.channels {
+            self.out.clear();
+            up.process(&self.buf, &mut self.out);
+        } else {
+            self.up_buf.clear();
+            up.process(&self.buf, &mut self.up_buf);
+            self.out.clear();
+            self.out.reserve(self.up_buf.len() * 2);
+            for s in self.up_buf.as_chunks::<2>().0 {
+                self.out.extend_from_slice(s);
+                self.out.extend_from_slice(s);
             }
-            if ci == 1 {
-                now[1] = now[0];
-            }
-            let mid = [
-                ((i32::from(self.last[0]) + i32::from(now[0])) / 2) as i16,
-                ((i32::from(self.last[1]) + i32::from(now[1])) / 2) as i16,
-            ];
-            for f in [mid, now] {
-                for s in f.iter().take(co) {
-                    self.out.extend_from_slice(&s.to_le_bytes());
-                }
-            }
-            self.last = now;
         }
         Some(&self.out)
     }
@@ -1197,7 +1193,7 @@ impl PacketDecoder {
         let soft = Soft::new(kind, &params, rate, channels);
         let note = match kind {
             Kind::HeAac { .. } if soft.available() => {
-                " (software: the AAC-LC core only, upsampled)"
+                " (software: the AAC-LC core only, upsampled 2x)"
             }
             Kind::HeAac { .. } => " (software: none, silence)",
             _ => "",
@@ -1473,7 +1469,7 @@ impl Decode {
         // HE-AAC in software: the core only.
         let note = match self.kind {
             Kind::HeAac { .. } if self.soft.available() => {
-                ", the AAC-LC core only (no SBR decoder), upsampled"
+                ", the AAC-LC core only (no SBR decoder), upsampled 2x (half-band)"
             }
             Kind::HeAac { .. } => ", no decoder for it: silence",
             _ => "",
