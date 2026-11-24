@@ -12,6 +12,8 @@
 #   menu    Audio On at 20 s; window 30-50 s, the main menu (menu-long: 30-150 s)
 #   modes   + Start Game at 45 s; window 50-57 s, the mode screen
 #   flight  + Survival Mode, Start x2; window 100-130 s, survival flight with enemies
+#   spore   Spore Origins into play (two taps); window 70-100 s. Its save folder is copied
+#           before the runs and put back after them.
 # Every run: N72_FIXED_SEED=1, n72-ui stopped, panel on, backlight 0 (restored at the end).
 # PROF=1: also the N72_PROF sampler over the window (prof.bin + maps.txt, for prof-report.py);
 # the sampler rides on the existing time-slice tick, but keep timing runs and profile runs apart.
@@ -32,7 +34,8 @@ menu)   TAPS="20:156,240"; W0=30; W1=50 ;;
 menu-long) TAPS="20:156,240"; W0=30; W1=150 ;;	# the menu for 2 minutes (routing decisions over time)
 modes)  TAPS="20:156,240 45:118,240"; W0=50; W1=57 ;;
 flight) TAPS="20:156,240 45:118,240 58:194,240 72:305,72 84:305,72"; W0=100; W1=130 ;;
-*) echo "route: menu, menu-long, modes or flight"; exit 2 ;;
+spore)  APP=touchHLE_apps/Spore.app; TAPS="32:300,25 38:128,238"; W0=70; W1=100 ;;	# into play (runx.sh's taps)
+*) echo "route: menu, menu-long, modes, flight or spore"; exit 2 ;;
 esac
 OUT=${OUT:-/root/gof/ab/$(date +%Y%m%d-%H%M)-$R}
 mkdir -p $OUT/runs || exit 1
@@ -47,6 +50,9 @@ busy() {
 	return 1
 }
 restore() {
+	if [ -n "$SB" ] && [ -d $OUT/spore-save ]; then
+		rm -rf $SB && cp -a $OUT/spore-save $SB && echo "Spore's save put back"
+	fi
 	[ -f /root/gof/brightness.saved ] && for f in /sys/class/backlight/*/brightness; do cat /root/gof/brightness.saved > $f; done
 	rm -f /root/gof/brightness.saved
 	tp=$(pidof n72-tapd) && kill $tp
@@ -90,6 +96,10 @@ done < $V
 cat $OUT/info.txt
 [ -f $OUT/results.tsv ] || echo "route	round	name	fps_med	fps_min	fps_max	seconds	main_ms_frame	other_ms_frame	scenes_frame	ta_ms_frame	render_ms_frame" > $OUT/results.tsv
 
+if [ $R = spore ]; then	# the game saves as it is played: the user's save back afterwards
+	SB=$H/touchHLE_sandbox/com.ea.spore.naj.efigsj
+	rm -rf $OUT/spore-save; cp -a $SB $OUT/spore-save || exit 1
+fi
 pidof n72-ui >/dev/null && { rc-service n72-ui stop >/dev/null; sleep 1; }
 [ -f /root/gof/brightness.saved ] || cat /sys/class/backlight/*/brightness > /root/gof/brightness.saved
 echo 1 > $LCD
