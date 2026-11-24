@@ -72,6 +72,10 @@ impl RasterGlyph<'_> {
     pub fn dimensions(&self) -> (i32, i32) {
         self.dimensions
     }
+    /// Get the rasterized alpha coverage pixels (row-major).
+    pub fn pixels(&self) -> &[f32] {
+        self.pixels
+    }
     /// Get the coverage at the given co-ordinates within the glyph.
     pub fn pixel_at(&self, coords: (i32, i32)) -> f32 {
         let (width, height) = self.dimensions;
@@ -457,17 +461,7 @@ impl Font {
         let mut baseline = origin.1 + self.v_metrics_scaled(font_size).ascent;
         let (line_height, line_gap) = self.line_height_and_gap(font_size);
 
-        // RustType requires a "draw pixel" callback that will be called for
-        // each pixel in the glyph's bounding box, in left-to-right
-        // top-to-bottom order. This is unfortunately incompatible with
-        // touchHLE's code which needs to be able to sample the pixels in any
-        // order in order to support rotation. This is worked around by creating
-        // a temporary bitmap for the glyph, and then the caller of this
-        // function can provide a "draw glyph" callback that can do whatever it
-        // wants with this bitmap.
-        // TODO: Do we need to increase the font size when scale transforms are
-        //       used, to avoid blurry text?
-        let mut glyph_bitmap: Vec<f32> = Vec::new();
+        let mut cache = self.glyph_cache.borrow_mut();
 
         for (line_width, line_text) in lines {
             let line_x_offset = match alignment {
@@ -489,7 +483,6 @@ impl Font {
                 let qx = ((pos.x - ix) * 4.0).round() as u8; // 0..=4
                 let qy = ((pos.y - iy) * 4.0).round() as u8;
                 let key: GlyphKey = (glyph.id().0, glyph.scale().x.to_bits(), qx, qy);
-                let mut cache = self.glyph_cache.borrow_mut();
                 if cache.map.len() >= GlyphCache::MAX_ENTRIES {
                     cache.map.clear();
                 }
@@ -509,7 +502,6 @@ impl Font {
                 let Some(((bx, by), dims, bitmap)) = cached else {
                     continue;
                 };
-                let dims = *dims;
                 let glyph_origin = (ix as i32 + *bx, iy as i32 + *by);
 
                 // TODO: Refactor this method to support y clipping too.
@@ -524,14 +516,10 @@ impl Font {
                     }
                 }
 
-                glyph_bitmap.clear();
-                glyph_bitmap.extend_from_slice(bitmap);
-                drop(cache);
-
                 let raster_glyph = RasterGlyph {
                     origin: (glyph_origin.0 as f32, glyph_origin.1 as f32),
                     dimensions: (dims.0 as i32, dims.1 as i32),
-                    pixels: &glyph_bitmap,
+                    pixels: bitmap,
                 };
 
                 draw_glyph(raster_glyph);

@@ -308,6 +308,14 @@ pub fn draw_font_glyph(
     }
 
     crate::frameworks::core_graphics::cg_bitmap_context::n72_cg_stats::op("text");
+    if drawer.draw_glyph_axis_aligned(
+        glyph_rect,
+        raster_glyph.dimensions(),
+        raster_glyph.pixels(),
+        fill_color,
+    ) {
+        return;
+    }
     // n72 fork: a pixel the glyph does not cover blends a fully transparent
     // colour, which in the normal blend mode into a context with alpha leaves
     // it as it is: not touched at all (a read-blend-write would round it

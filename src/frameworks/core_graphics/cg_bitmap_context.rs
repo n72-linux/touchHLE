@@ -503,6 +503,193 @@ impl CGBitmapContextDrawer<'_> {
         )
     }
 
+    /// n72 fork: blit an axis-aligned (`|a| == 1`, `|d| == 1`, `b == c == 0`)
+    /// glyph under normal blending directly into an alpha bitmap context,
+    /// avoiding per-pixel iterator/matrix/roundf work and transparent-bg reads.
+    /// Returns `false` if the caller should fall back to the generic loop.
+    pub fn draw_glyph_axis_aligned(
+        &mut self,
+        glyph_rect: CGRect,
+        raster_dims: (i32, i32),
+        raster_pixels: &[f32],
+        fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    ) -> bool {
+        let t = self.transform;
+        if t.b != 0.0 || t.c != 0.0 || t.a.abs() != 1.0 || t.d.abs() != 1.0 {
+            return false;
+        }
+        if self.blend_mode != kCGBlendModeNormal || self.bitmap_info.bits_per_component != 8 {
+            return false;
+        }
+        if glyph_rect.size.width <= 0.0 || glyph_rect.size.height <= 0.0 {
+            return false;
+        }
+        let alpha_info = self.bitmap_info.alpha_info;
+        let is_alpha_only = alpha_info == kCGImageAlphaOnly;
+        let is_premul = matches!(
+            alpha_info,
+            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst
+        );
+        let is_straight = matches!(alpha_info, kCGImageAlphaLast | kCGImageAlphaFirst);
+        if !is_alpha_only && !is_premul && !is_straight {
+            return false;
+        }
+        if is_alpha_only {
+            if self.pixel_size != 1 {
+                return false;
+            }
+        } else if self.bitmap_info.color_space != kCGColorSpaceGenericRGB || self.pixel_size != 4 {
+            return false;
+        }
+        if raster_dims.0 <= 0 || raster_dims.1 <= 0 {
+            return true;
+        }
+
+        let width = self.width();
+        let height = self.height();
+        let bounding_rect = t.apply_to_rect(glyph_rect);
+        let x_start = bounding_rect.origin.x.round().max(0.0) as GuestUSize;
+        let y_start = bounding_rect.origin.y.round().max(0.0) as GuestUSize;
+        let x_end = (bounding_rect.origin.x + bounding_rect.size.width)
+            .round()
+            .min(width as f32) as GuestUSize;
+        let y_end = (bounding_rect.origin.y + bounding_rect.size.height)
+            .round()
+            .min(height as f32) as GuestUSize;
+        if x_start >= x_end || y_start >= y_end {
+            return true;
+        }
+
+        let inverse = t.invert();
+        let Some(x_span) = axis_aligned_span(x_start, x_end, |x| {
+            let u = inverse.apply_to_point(CGPoint {
+                x: x as f32 + 0.5,
+                y: 0.5,
+            });
+            let w = (u.x - glyph_rect.origin.x) / glyph_rect.size.width;
+            (0.0..1.0).contains(&w)
+        }) else {
+            return false;
+        };
+        let Some((x0, x1)) = x_span else {
+            return true;
+        };
+        let Some(y_span) = axis_aligned_span(y_start, y_end, |y| {
+            let u = inverse.apply_to_point(CGPoint {
+                x: 0.5,
+                y: y as f32 + 0.5,
+            });
+            let w = (u.y - glyph_rect.origin.y) / glyph_rect.size.height;
+            (0.0..1.0).contains(&w)
+        }) else {
+            return false;
+        };
+        let Some((y0, y1)) = y_span else {
+            return true;
+        };
+
+        let u0 = inverse.apply_to_point(CGPoint {
+            x: x0 as f32 + 0.5,
+            y: y0 as f32 + 0.5,
+        });
+        let sx0 = (u0.x - glyph_rect.origin.x - 0.5).round() as i32;
+        let sy0 = (u0.y - glyph_rect.origin.y - 0.5).round() as i32;
+        let step_x = if inverse.a > 0.0 { 1 } else { -1 };
+        let step_y = if inverse.d > 0.0 { 1 } else { -1 };
+
+        let Some((x0, x1, sx0)) = clip_src_axis(x0, x1, sx0, step_x, raster_dims.0) else {
+            return true;
+        };
+        let Some((y0, y1, mut sy)) = clip_src_axis(y0, y1, sy0, step_y, raster_dims.1) else {
+            return true;
+        };
+
+        let bpr = self.bitmap_info.bytes_per_row as usize;
+        let rw = raster_dims.0 as usize;
+        let (fr, fg, fb, fa) = fill_color;
+        let mut drawn_pixels = 0u64;
+
+        if is_alpha_only {
+            for y in y0..=y1 {
+                let dst_row = ((height - 1 - y) * self.bitmap_info.bytes_per_row) as usize;
+                let src_row = (sy as usize) * rw;
+                let mut sx = sx0;
+                for x in x0..=x1 {
+                    let cov = raster_pixels[src_row + sx as usize];
+                    sx += step_x;
+                    if cov == 0.0 {
+                        continue;
+                    }
+                    drawn_pixels += 1;
+                    let idx = dst_row + x as usize;
+                    let fg_a = fa * cov;
+                    let out_a = if cov == 1.0 && fa == 1.0 {
+                        1.0
+                    } else {
+                        let bg_a = self.pixels[idx] as f32 / 255.0;
+                        fg_a + bg_a * (1.0 - fg_a)
+                    };
+                    self.pixels[idx] = (out_a * 255.0) as u8;
+                }
+                sy += step_y;
+            }
+            if drawn_pixels > 0 {
+                n72_cg_stats::count(drawn_pixels);
+            }
+            return true;
+        }
+
+        let (r_off, g_off, b_off, a_off_opt) = self.pixel_offset;
+        let a_off = a_off_opt.unwrap();
+        let solid_rgb = [
+            (gamma_encode_fast(fr) * 255.0) as u8,
+            (gamma_encode_fast(fg) * 255.0) as u8,
+            (gamma_encode_fast(fb) * 255.0) as u8,
+        ];
+
+        for y in y0..=y1 {
+            let dst_row = ((height - 1 - y) as usize) * bpr;
+            let src_row = (sy as usize) * rw;
+            let mut sx = sx0;
+            for x in x0..=x1 {
+                let cov = raster_pixels[src_row + sx as usize];
+                sx += step_x;
+                if cov == 0.0 {
+                    continue;
+                }
+                drawn_pixels += 1;
+                let idx = dst_row + (x as usize) * 4;
+                if cov == 1.0 && fa == 1.0 {
+                    self.pixels[idx + r_off] = solid_rgb[0];
+                    self.pixels[idx + g_off] = solid_rgb[1];
+                    self.pixels[idx + b_off] = solid_rgb[2];
+                    self.pixels[idx + a_off] = 255;
+                    continue;
+                }
+                let pixel = (fr * cov, fg * cov, fb * cov, fa * cov);
+                let (r, g, b, a) = if self.pixels[idx..idx + 4] == [0, 0, 0, 0] && fa > 0.0 {
+                    pixel
+                } else {
+                    let bg = get_pixel_at(self.pixel_offset, self.pixels, idx);
+                    if is_premul {
+                        blend_premultiplied(bg, pixel, kCGBlendModeNormal)
+                    } else {
+                        blend_straight(bg, pixel, kCGBlendModeNormal)
+                    }
+                };
+                self.pixels[idx + r_off] = (gamma_encode_fast(r) * 255.0) as u8;
+                self.pixels[idx + g_off] = (gamma_encode_fast(g) * 255.0) as u8;
+                self.pixels[idx + b_off] = (gamma_encode_fast(b) * 255.0) as u8;
+                self.pixels[idx + a_off] = (a * 255.0) as u8;
+            }
+            sy += step_y;
+        }
+        if drawn_pixels > 0 {
+            n72_cg_stats::count(drawn_pixels);
+        }
+        true
+    }
+
     /// n72 fork: the pixels [Self::iter_transformed_pixels] would visit for an
     /// axis-aligned transform, set to zero a row span at a time (what
     /// put_pixel writes for a clear). Returns false (nothing done) otherwise.
@@ -539,13 +726,12 @@ impl CGBitmapContextDrawer<'_> {
             let w = (u.y - untransformed_rect.origin.y) / untransformed_rect.size.height;
             (0.0..1.0).contains(&w)
         };
-        let xs: Vec<GuestUSize> = (x_start..x_end).filter(|&x| inside_x(x)).collect();
-        let (Some(&x0), Some(&x1)) = (xs.first(), xs.last()) else {
+        let Some(span) = axis_aligned_span(x_start, x_end, inside_x) else {
+            return false; // not a single span (cannot happen; be safe)
+        };
+        let Some((x0, x1)) = span else {
             return true; // nothing inside
         };
-        if (x1 - x0 + 1) as usize != xs.len() {
-            return false; // not a single span (cannot happen; be safe)
-        }
         let px = self.pixel_size;
         let alpha_only = self.bitmap_info.alpha_info == kCGImageAlphaOnly;
         let (width, height, bpr) = (
@@ -615,6 +801,82 @@ impl CGBitmapContextDrawer<'_> {
     }
 }
 
+fn axis_aligned_span(
+    start: GuestUSize,
+    end: GuestUSize,
+    inside: impl Fn(GuestUSize) -> bool,
+) -> Option<Option<(GuestUSize, GuestUSize)>> {
+    let mut first: Option<GuestUSize> = None;
+    let mut last: GuestUSize = 0;
+    let mut count: GuestUSize = 0;
+    for v in start..end {
+        if inside(v) {
+            if first.is_none() {
+                first = Some(v);
+            }
+            last = v;
+            count += 1;
+        }
+    }
+    match first {
+        None => Some(None),
+        Some(a) if last - a + 1 == count => Some(Some((a, last))),
+        Some(_) => None,
+    }
+}
+
+fn clip_src_axis(
+    a0: GuestUSize,
+    a1: GuestUSize,
+    mut s0: i32,
+    step: i32,
+    limit: i32,
+) -> Option<(GuestUSize, GuestUSize, i32)> {
+    let mut lo = a0;
+    let mut hi = a1;
+    let len = (hi - lo) as i32;
+    if step > 0 {
+        if s0 < 0 {
+            let skip = -s0;
+            if skip > len {
+                return None;
+            }
+            lo += skip as GuestUSize;
+            s0 = 0;
+        }
+        let s_end = s0 + (hi - lo) as i32;
+        if s_end >= limit {
+            let over = s_end - (limit - 1);
+            if over > (hi - lo) as i32 {
+                return None;
+            }
+            hi -= over as GuestUSize;
+        }
+    } else {
+        if s0 >= limit {
+            let skip = s0 - (limit - 1);
+            if skip > len {
+                return None;
+            }
+            lo += skip as GuestUSize;
+            s0 = limit - 1;
+        }
+        let s_end = s0 - (hi - lo) as i32;
+        if s_end < 0 {
+            let over = -s_end;
+            if over > (hi - lo) as i32 {
+                return None;
+            }
+            hi -= over as GuestUSize;
+        }
+    }
+    if lo > hi {
+        None
+    } else {
+        Some((lo, hi, s0))
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn test_iter_transformed_pixels() {
@@ -636,6 +898,8 @@ fn test_iter_transformed_pixels() {
                 color_space: "kCGColorSpaceGenericRGB",
                 alpha_info: 0,
             },
+            pixel_offset: (0, 1, 2, None),
+            pixel_size: 3,
             rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
             blend_mode: kCGBlendModeNormal,
             transform,
@@ -708,6 +972,154 @@ fn test_iter_transformed_pixels() {
     assert!(make_context(2, 2, rotation_by_180deg.translate(-2.0, -2.0))
         .iter_transformed_pixels(square_2x2_at_0_0)
         .eq(inverted_square_2x2_at_0_0.into_iter()));
+}
+
+#[cfg(test)]
+#[test]
+fn test_draw_glyph_axis_aligned() {
+    use super::CGSize;
+
+    fn make_drawer<'a>(
+        width: GuestUSize,
+        height: GuestUSize,
+        alpha_info: CGImageAlphaInfo,
+        transform: CGAffineTransform,
+        pixels: &'a mut [u8],
+    ) -> CGBitmapContextDrawer<'a> {
+        let px = if alpha_info == kCGImageAlphaOnly { 1 } else { 4 };
+        let bitmap_info = CGBitmapContextData {
+            data: crate::mem::Ptr::null(),
+            data_is_owned: false,
+            width,
+            height,
+            bits_per_component: 8,
+            bytes_per_row: px * width,
+            color_space: kCGColorSpaceGenericRGB,
+            alpha_info,
+        };
+        CGBitmapContextDrawer {
+            pixel_offset: pixel_offsets(&bitmap_info),
+            pixel_size: px,
+            bitmap_info,
+            rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
+            blend_mode: kCGBlendModeNormal,
+            transform,
+            pixels,
+        }
+    }
+
+    let w = 16u32;
+    let h = 16u32;
+    let raster_dims = (6i32, 5i32);
+    let raster_pixels: Vec<f32> = (0..(raster_dims.0 * raster_dims.1))
+        .map(|i| match i % 5 {
+            0 => 0.0,
+            1 => 1.0,
+            2 => 0.25,
+            3 => 0.5,
+            _ => 0.875,
+        })
+        .collect();
+
+    let alpha_infos = [
+        kCGImageAlphaPremultipliedLast,
+        kCGImageAlphaPremultipliedFirst,
+        kCGImageAlphaLast,
+        kCGImageAlphaFirst,
+        kCGImageAlphaOnly,
+    ];
+    let transforms = [
+        CGAffineTransformIdentity,
+        CGAffineTransform {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            tx: 0.0,
+            ty: h as f32,
+        },
+        CGAffineTransform::make_translation(-2.0, -1.0),
+        CGAffineTransform {
+            a: -1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            tx: w as f32 + 1.25,
+            ty: h as f32,
+        },
+    ];
+    let rects = [
+        CGRect {
+            origin: CGPoint { x: 3.0, y: 5.0 },
+            size: CGSize {
+                width: 6.0,
+                height: 5.0,
+            },
+        },
+        CGRect {
+            // partially clipped right/bottom
+            origin: CGPoint { x: 1.0, y: 2.0 },
+            size: CGSize {
+                width: 4.5,
+                height: 3.5,
+            },
+        },
+    ];
+    let colors = [(1.0, 1.0, 1.0, 1.0), (0.9, 0.45, 0.2, 0.75)];
+    let bgs: [[u8; 4]; 3] = [[0, 0, 0, 0], [40, 80, 120, 128], [200, 150, 50, 255]];
+
+    for &alpha_info in &alpha_infos {
+        let px_bytes = if alpha_info == kCGImageAlphaOnly { 1 } else { 4 };
+        for &transform in &transforms {
+            for &rect in &rects {
+                for &color in &colors {
+                    for &bg in &bgs {
+                        let init: Vec<u8> = (0..(w * h) as usize)
+                            .flat_map(|_| bg[..px_bytes].iter().copied())
+                            .collect();
+                        let mut expected = init.clone();
+                        let mut actual = init;
+
+                        {
+                            let mut d_exp = make_drawer(w, h, alpha_info, transform, &mut expected);
+                            let skip_uncovered = d_exp.blends_normally();
+                            for ((x, y), (tx, ty)) in d_exp.iter_transformed_pixels(rect) {
+                                let sx = (tx * rect.size.width - 0.5).round() as i32;
+                                let sy = (ty * rect.size.height - 0.5).round() as i32;
+                                let cov = if (0..raster_dims.0).contains(&sx)
+                                    && (0..raster_dims.1).contains(&sy)
+                                {
+                                    raster_pixels[sy as usize * raster_dims.0 as usize + sx as usize]
+                                } else {
+                                    0.0
+                                };
+                                if cov == 0.0 && skip_uncovered {
+                                    continue;
+                                }
+                                let p = (color.0 * cov, color.1 * cov, color.2 * cov, color.3 * cov);
+                                d_exp.put_pixel((x, y), p, true);
+                            }
+                        }
+
+                        {
+                            let mut d_act = make_drawer(w, h, alpha_info, transform, &mut actual);
+                            assert!(d_act.draw_glyph_axis_aligned(
+                                rect,
+                                raster_dims,
+                                &raster_pixels,
+                                color,
+                            ));
+                        }
+
+                        assert_eq!(
+                            actual, expected,
+                            "mismatch for alpha_info={alpha_info} transform={transform:?} rect={rect:?} color={color:?} bg={bg:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Implementation of `CGContextFillRect` (`clear` == [false]) and
@@ -804,8 +1216,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGBitmapContextGetBytesPerRow(_)),
 ];
 
-/// n72 fork, profiling aid: with N72_CG_STATS set, log once a second how many
-/// pixels the software Core Graphics drew per kind of operation.
+/// n72 fork, profiling aid (`n72-prof` feature): with N72_CG_STATS set,
+/// log once a second how many pixels the software Core Graphics drew per kind
+/// of operation.
+#[cfg(feature = "n72-prof")]
 pub(crate) mod n72_cg_stats {
     use std::cell::RefCell;
     use std::time::Instant;
@@ -877,4 +1291,12 @@ pub(crate) mod n72_cg_stats {
             }
         })
     }
+}
+
+#[cfg(not(feature = "n72-prof"))]
+pub(crate) mod n72_cg_stats {
+    #[inline(always)]
+    pub fn op(_: &'static str) {}
+    #[inline(always)]
+    pub fn count(_: u64) {}
 }
