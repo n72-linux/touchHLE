@@ -467,10 +467,19 @@ impl CGBitmapContextDrawer<'_> {
             self.rgb_fill_color.3, // alpha is always linear
         )
     }
-    /// n72 fork: whether blending a fully transparent colour leaves a pixel
-    /// as it is (the normal blend mode).
+    /// n72 fork: whether drawing a fully transparent colour with blending
+    /// leaves a pixel as it is: the normal blend mode, into a context that has
+    /// alpha (put_pixel writes the colour unblended into one without).
     pub fn blends_normally(&self) -> bool {
         self.blend_mode == kCGBlendModeNormal
+            && matches!(
+                self.bitmap_info.alpha_info,
+                kCGImageAlphaLast
+                    | kCGImageAlphaFirst
+                    | kCGImageAlphaPremultipliedLast
+                    | kCGImageAlphaPremultipliedFirst
+                    | kCGImageAlphaOnly
+            )
     }
     /// Set the pixel at `coords` to `color`. `color` must be linear RGB, not
     /// sRGB! Note that `coords` are absolute: you must do transformation

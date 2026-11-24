@@ -309,8 +309,9 @@ pub fn draw_font_glyph(
 
     crate::frameworks::core_graphics::cg_bitmap_context::n72_cg_stats::op("text");
     // n72 fork: a pixel the glyph does not cover blends a fully transparent
-    // colour, which in the normal blend mode leaves it as it is: not touched
-    // at all (a read-blend-write would round it through the gamma tables).
+    // colour, which in the normal blend mode into a context with alpha leaves
+    // it as it is: not touched at all (a read-blend-write would round it
+    // through the gamma tables). Contexts without alpha are drawn as before.
     let skip_uncovered = drawer.blends_normally();
     for ((x, y), (tex_x, tex_y)) in drawer.iter_transformed_pixels(glyph_rect) {
         // TODO: bilinear sampling
