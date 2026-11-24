@@ -9,7 +9,7 @@
 # rotated by one each round (ABC, BCA, CAB) so that warm-up and battery drift do not favour one.
 #
 # ROUTE (seconds from the start, taps through n72-tapd; window = what is measured):
-#   menu    Audio On at 20 s; window 30-50 s, the main menu
+#   menu    Audio On at 20 s; window 30-50 s, the main menu (menu-long: 30-150 s)
 #   modes   + Start Game at 45 s; window 50-57 s, the mode screen
 #   flight  + Survival Mode, Start x2; window 100-130 s, survival flight with enemies
 # Every run: N72_FIXED_SEED=1, n72-ui stopped, panel on, backlight 0 (restored at the end).
@@ -28,9 +28,10 @@ H=/root/n72hle-test
 APP=touchHLE_apps/GalaxyOnFire.app
 case $R in
 menu)   TAPS="20:156,240"; W0=30; W1=50 ;;
+menu-long) TAPS="20:156,240"; W0=30; W1=150 ;;	# the menu for 2 minutes (routing decisions over time)
 modes)  TAPS="20:156,240 45:118,240"; W0=50; W1=57 ;;
 flight) TAPS="20:156,240 45:118,240 58:194,240 72:305,72 84:305,72"; W0=100; W1=130 ;;
-*) echo "route: menu, modes or flight"; exit 2 ;;
+*) echo "route: menu, menu-long, modes or flight"; exit 2 ;;
 esac
 OUT=${OUT:-/root/gof/ab/$(date +%Y%m%d-%H%M)-$R}
 mkdir -p $OUT/runs || exit 1
