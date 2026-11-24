@@ -490,26 +490,31 @@ pub fn write_direct(mem: &mut Mem, site: VAddr, host_fn: u32, ready: u32) -> boo
     let common = match commons.iter().find(|&&(r, c)| r == ready && in_range(c, site)) {
         Some(&(_, c)) => c,
         None => {
-            let c = gates.alloc_near(mem, 17 * 4, Some(site));
+            let c = gates.alloc_near(mem, 20 * 4, Some(site));
             let off = |i: u32, lit: u32| -> u32 { 4 * lit - (4 * i + 8) };
             let in_guest = std::ptr::addr_of!(N72_IN_GUEST) as u32;
             // On entry ip = the stub's third word (its branch to the gate);
-            // the host function's address follows it.
-            let words: [u32; 17] = [
-                0xe92d_4010,              // push {r4, lr}
-                0xe59f_4000 | off(1, 15), // ldr r4, =ready
+            // the host function's address follows it. Darwin/iOS guest stacks
+            // are only 4-byte aligned, so align sp to 8 bytes for Linux AAPCS
+            // before calling into host GL/libc/libm.
+            let words: [u32; 20] = [
+                0xe92d_4030,              // push {r4, r5, lr}
+                0xe59f_4000 | off(1, 18), // ldr r4, =ready
                 0xe594_e000,              // ldr lr, [r4]
                 0xe35e_0000,              // cmp lr, #0
-                0x0a00_0007,              // beq 13f
-                0xe59f_4000 | off(5, 16), // ldr r4, =N72_IN_GUEST
+                0x0a00_000a,              // beq 16f
+                0xe1a0_500d,              // mov r5, sp
+                0xe3cd_d007,              // bic sp, sp, #7
+                0xe59f_4000 | off(7, 19), // ldr r4, =N72_IN_GUEST
                 0xe3a0_e000,              // mov lr, #0
                 0xe584_e000,              // str lr, [r4]
                 0xe59c_c004,              // ldr ip, [ip, #4]
                 0xe12f_ff3c,              // blx ip
                 0xe3a0_c001,              // mov ip, #1
                 0xe584_c000,              // str ip, [r4]
-                0xe8bd_8010,              // pop {r4, pc}
-                0xe8bd_4010,              // 13: pop {r4, lr}
+                0xe1a0_d005,              // mov sp, r5
+                0xe8bd_8030,              // pop {r4, r5, pc}
+                0xe8bd_4030,              // 16: pop {r4, r5, lr}
                 0xe12f_ff1c,              // bx ip (the stub's branch to the gate)
                 ready,
                 in_guest,
@@ -517,7 +522,7 @@ pub fn write_direct(mem: &mut Mem, site: VAddr, host_fn: u32, ready: u32) -> boo
             for (i, w) in words.iter().enumerate() {
                 mem.write(Ptr::from_bits(c + 4 * i as u32), *w);
             }
-            flush_icache(c, 17 * 4);
+            flush_icache(c, 20 * 4);
             commons.push((ready, c));
             c
         }
@@ -568,39 +573,34 @@ mod signals {
     // the interrupted PC (bit 0 = Thumb) and LR of the guest thread, which is
     // a wall-clock profile (blocked syscalls show at their libc call site).
     // SIGUSR2, or a full buffer, writes the pairs to the file as raw u32s.
-    #[cfg(target_arch = "arm")]
-    const PROF_MAX: usize = 60_000;
-    #[cfg(target_arch = "arm")]
-    static mut PROF_ON: u32 = 0;
-    #[cfg(target_arch = "arm")]
-    static mut PROF_N: usize = 0;
-    /// Ticks (10 ms) still to skip before sampling starts (N72_PROF_SKIP=seconds):
-    /// keeps loading screens out of a profile of the game itself.
-    static mut PROF_SKIP: u32 = 0;
-    #[cfg(target_arch = "arm")]
-    static mut PROF_DUMPED: u32 = 0;
-    #[cfg(target_arch = "arm")]
-    static mut PROF_BUF: [u32; PROF_MAX * 2] = [0; PROF_MAX * 2];
-    #[cfg(target_arch = "arm")]
-    static mut PROF_PATH: [u8; 128] = [0; 128];
+    #[cfg(all(target_arch = "arm", feature = "n72-prof"))]
+    mod prof {
+        pub const MAX: usize = 60_000;
+        pub static mut ON: u32 = 0;
+        pub static mut N: usize = 0;
+        /// Ticks (10 ms) still to skip before sampling starts (N72_PROF_SKIP=seconds):
+        /// keeps loading screens out of a profile of the game itself.
+        pub static mut SKIP: u32 = 0;
+        pub static mut DUMPED: u32 = 0;
+        pub static mut BUF: [u32; MAX * 2] = [0; MAX * 2];
+        pub static mut PATH: [u8; 128] = [0; 128];
 
-    #[cfg(target_arch = "arm")]
-    unsafe fn prof_dump() {
-        let fd = libc::open(
-            std::ptr::addr_of!(PROF_PATH) as *const libc::c_char,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            0o644,
-        );
-        if fd >= 0 {
-            let n = std::ptr::addr_of!(PROF_N).read_volatile();
-            libc::write(fd, std::ptr::addr_of!(PROF_BUF) as *const _, n * 8);
-            libc::close(fd);
+        pub unsafe fn dump() {
+            let fd = libc::open(
+                std::ptr::addr_of!(PATH) as *const libc::c_char,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            );
+            if fd >= 0 {
+                let n = std::ptr::addr_of!(N).read_volatile();
+                libc::write(fd, std::ptr::addr_of!(BUF) as *const _, n * 8);
+                libc::close(fd);
+            }
         }
-    }
 
-    #[cfg(target_arch = "arm")]
-    unsafe extern "C" fn prof_dump_handler(_sig: libc::c_int) {
-        prof_dump();
+        pub unsafe extern "C" fn dump_handler(_sig: libc::c_int) {
+            dump();
+        }
     }
 
     #[cfg(target_arch = "arm")]
@@ -650,16 +650,17 @@ mod signals {
                 assert!(libc::sigaction(sig, &sa, std::ptr::null_mut()) == 0);
             }
 
+            #[cfg(feature = "n72-prof")]
             if let Ok(path) = std::env::var("N72_PROF") {
                 let b = path.as_bytes();
                 if b.len() < 127 {
-                    let dst = &mut *std::ptr::addr_of_mut!(PROF_PATH);
+                    let dst = &mut *std::ptr::addr_of_mut!(prof::PATH);
                     dst[..b.len()].copy_from_slice(b);
-                    std::ptr::addr_of_mut!(PROF_ON).write_volatile(1);
+                    std::ptr::addr_of_mut!(prof::ON).write_volatile(1);
                     if let Some(secs) = std::env::var("N72_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()) {
-                        std::ptr::addr_of_mut!(PROF_SKIP).write_volatile(secs * 100);
+                        std::ptr::addr_of_mut!(prof::SKIP).write_volatile(secs * 100);
                     }
-                    libc::signal(libc::SIGUSR2, prof_dump_handler as *const () as usize);
+                    libc::signal(libc::SIGUSR2, prof::dump_handler as *const () as usize);
                     log!(
                         "n72 profiler on: kill -USR2 {} writes {}",
                         libc::getpid(),
@@ -704,19 +705,20 @@ mod signals {
         let asm = (&n72_asm_start as *const u8 as usize)..(&n72_asm_end as *const u8 as usize);
         let in_guest = std::ptr::addr_of!(N72_IN_GUEST).read_volatile() != 0 && !asm.contains(&pc);
 
-        if sig == timer_signal() && std::ptr::addr_of!(PROF_ON).read_volatile() != 0 {
-            let n = std::ptr::addr_of!(PROF_N).read_volatile();
-            let skip = std::ptr::addr_of!(PROF_SKIP).read_volatile();
+        #[cfg(feature = "n72-prof")]
+        if sig == timer_signal() && std::ptr::addr_of!(prof::ON).read_volatile() != 0 {
+            let n = std::ptr::addr_of!(prof::N).read_volatile();
+            let skip = std::ptr::addr_of!(prof::SKIP).read_volatile();
             if skip > 0 {
-                std::ptr::addr_of_mut!(PROF_SKIP).write_volatile(skip - 1);
-            } else if n < PROF_MAX {
-                let buf = &mut *std::ptr::addr_of_mut!(PROF_BUF);
+                std::ptr::addr_of_mut!(prof::SKIP).write_volatile(skip - 1);
+            } else if n < prof::MAX {
+                let buf = &mut *std::ptr::addr_of_mut!(prof::BUF);
                 buf[2 * n] = mc.arm_pc as u32 | ((mc.arm_cpsr as u32 >> 5) & 1);
                 buf[2 * n + 1] = mc.arm_lr as u32;
-                std::ptr::addr_of_mut!(PROF_N).write_volatile(n + 1);
-            } else if std::ptr::addr_of!(PROF_DUMPED).read_volatile() == 0 {
-                std::ptr::addr_of_mut!(PROF_DUMPED).write_volatile(1);
-                prof_dump();
+                std::ptr::addr_of_mut!(prof::N).write_volatile(n + 1);
+            } else if std::ptr::addr_of!(prof::DUMPED).read_volatile() == 0 {
+                std::ptr::addr_of_mut!(prof::DUMPED).write_volatile(1);
+                prof::dump();
             }
         }
         let code = if sig == timer_signal() {

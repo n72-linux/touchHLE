@@ -292,6 +292,9 @@ impl Window {
     pub fn fixed_portrait_panel() -> bool {
         cfg!(feature = "cpu-native")
     }
+    pub fn scale_hack(&self) -> NonZeroU32 {
+        self.scale_hack
+    }
     pub fn new(
         title: &str,
         icon: Option<Image>,
