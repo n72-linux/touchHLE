@@ -1,4 +1,4 @@
-@ minimal iOS 4 entry (LC_UNIXTHREAD): sp -> argc, argv[], 0, envp[]
+@ minimal iOS entry (LC_UNIXTHREAD): sp -> argc, argv[], 0, envp[]
 	.text
 	.globl start
 	.align 2
@@ -11,3 +11,13 @@ start:
 	bl	_main
 	bl	_exit
 1:	b	1b
+
+@ An iPhone OS 3.0 link (classic relocations, no LC_DYLD_INFO) wants
+@ crt1.o's dyld_stub_binding_helper: the lazy pointers start out pointing
+@ at it. touchHLE never runs it: it rewrites every stub at load to call
+@ its own linker (Dyld::setup_lazy_linking). If anything does jump here,
+@ trap instead of running on.
+	.private_extern dyld_stub_binding_helper
+	.align 2
+dyld_stub_binding_helper:
+	trap
