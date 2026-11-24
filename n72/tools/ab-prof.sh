@@ -6,7 +6,7 @@
 # of that build given: HLE=path LIB=path (libn72gles.so.1.syms) in the environment; a rebuild
 # of the same commit is not the same binary (paths, compiler), so its touchHLE names are only
 # a guess: for profiles put touchHLE in the kit from an ab-build.sh output.
-# musl: the sysroot's (compare its md5 with the "musl" line in the run's info.txt).
+# musl: the device's copy in the results (PROF=1 runs), else the sysroot's (may differ).
 set -e
 W=$(cd "$(dirname "$0")/../../.." && pwd)
 T=$(cd "$(dirname "$0")" && pwd)
@@ -19,7 +19,8 @@ mh=${HLE:-$1}; ml=${LIB:-$2}
 [ -f "$ml" ] || { echo "libn72gles with symbols: give LIB=path ($2)"; exit 1; }
 ${CROSS}nm -n -C --defined-only "$mh" | grep -i ' [tw] ' > $d/hle.syms
 ${CROSS}nm -n --defined-only "$ml" | grep -i ' [tw] ' > $d/gles.syms
-m=$W/alpine-work/sysroot-armhf/lib/ld-musl-armhf.so.1
+m=$d/../../ld-musl-armhf.so.1	# the device's, saved by gofab.sh PROF=1
+[ -f $m ] || m=$W/alpine-work/sysroot-armhf/lib/ld-musl-armhf.so.1
 ${CROSS}nm -n -D --defined-only $m | grep -i ' [tw] ' > $d/musl.syms
 echo "musl on the Mac: $(md5 -q $m | cut -c1-8); on the device: $(grep -h '^musl' $d/../../info.txt 2>/dev/null)"
 cp $W/ab-kits/syms/gof.syms $d/

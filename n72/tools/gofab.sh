@@ -94,6 +94,7 @@ pidof n72-ui >/dev/null && { rc-service n72-ui stop >/dev/null; sleep 1; }
 echo 1 > $LCD
 for f in /sys/class/backlight/*/brightness; do echo 0 > $f; done
 dmesg | wc -l > $OUT/dmesg.start
+[ -n "$PROF" ] && cp /lib/ld-musl-armhf.so.1 $OUT/	# its symbols, for ab-prof.sh
 HZ=100	# USER_HZ: /proc/*/stat counts in it
 
 r=1
