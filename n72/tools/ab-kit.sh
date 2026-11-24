@@ -27,7 +27,12 @@ for spec; do
 	installed) dh=/root/n72hle-test/touchHLE; mh=installed ;;
 	/root/*|/usr/*) dh=$hle; mh=device ;;
 	*) f=$hle; [ -f "$f" ] || f=$W/$hle; [ -d "$f" ] && f=$f/touchHLE; [ -f "$f" ] || { echo "$name: no $hle"; exit 1; }
-	   mkdir -p $D/$name; ${CROSS}strip -o $D/$name/touchHLE "$f"; dh=$DEV/$name/touchHLE; mh=$(cd "$(dirname "$f")" && pwd)/touchHLE ;;
+	   mh=$(cd "$(dirname "$f")" && pwd)/touchHLE
+	   dh=$(awk -v m="$mh" '$2 == m {print $3; exit}' $S/hle.list 2>/dev/null)	# one copy per binary
+	   if [ -z "$dh" ]; then
+		mkdir -p $D/$name; ${CROSS}strip -o $D/$name/touchHLE "$f"; dh=$DEV/$name/touchHLE
+		echo "$name $mh $dh" >> $S/hle.list
+	   fi ;;
 	esac
 	case $lib in
 	installed) dl=-; ml=installed ;;
@@ -40,6 +45,7 @@ for spec; do
 	echo "$name $mh $ml" >> $W/ab-kits/$kit.sources.txt
 done
 cp $T/gofab.sh $D/
+rm -f $S/hle.list
 python3 -I $W/n72-alpine/toolchain/roottar.py $W/ab-kits/$kit.tar.gz $S ab
 rm -rf $W/ab-kits/$kit; mv $D $W/ab-kits/$kit; rm -rf $S
 echo "kit $W/ab-kits/$kit.tar.gz ($(du -k $W/ab-kits/$kit.tar.gz | cut -f1) KB):"
