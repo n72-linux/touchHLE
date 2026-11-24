@@ -23,6 +23,15 @@ use std::io::Read;
 pub struct Font {
     font: rusttype::Font<'static>,
     scale_factor: f32,
+    /// n72 fork: precomputed ASCII 0..128 glyph IDs and raw horizontal metrics
+    /// (advance, left side bearing) in font units, avoiding per-char cmap/hmtx
+    /// table walks on every frame.
+    ascii_glyph_ids: [GlyphId; 128],
+    ascii_h_metrics_raw: [(u16, i16); 128],
+    has_kern: bool,
+    /// Lazy cache of raw horizontal kerning (in font units) for ASCII pairs,
+    /// using `i32::MIN` as the unpopulated sentinel.
+    ascii_kern_raw: std::cell::RefCell<Option<Box<[i32; 128 * 128]>>>,
     /// n72 fork: rasterized glyphs, so text drawn again (every frame, for a
     /// scrolling ticker) is not re-rasterized from its outline each time.
     glyph_cache: std::cell::RefCell<GlyphCache>,
@@ -36,8 +45,49 @@ type GlyphKey = (u16, u32, u8, u8);
 type CachedGlyph = Option<((i32, i32), (usize, usize), Vec<f32>)>;
 
 #[derive(Default)]
+struct FxBuildHasher;
+
+struct FxHasher(u64);
+
+impl std::hash::BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> Self::Hasher {
+        FxHasher(0)
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u8(b);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517cc1b727220a95);
+    }
+}
+
+#[derive(Default)]
 struct GlyphCache {
-    map: std::collections::HashMap<GlyphKey, CachedGlyph>,
+    map: std::collections::HashMap<GlyphKey, CachedGlyph, FxBuildHasher>,
 }
 
 impl GlyphCache {
@@ -100,6 +150,34 @@ impl Font {
         self.font.glyph(char::from_u32(c as u32).unwrap()).id()
     }
 
+    fn from_rusttype(font: rusttype::Font<'static>, scale_factor: f32) -> Font {
+        let face = match &font {
+            rusttype::Font::Owned(f) => f.as_face_ref(),
+            _ => unreachable!(),
+        };
+        let ascii_glyph_ids: [GlyphId; 128] = std::array::from_fn(|i| {
+            let ch = char::from_u32(i as u32).unwrap();
+            font.glyph(ch).id()
+        });
+        let ascii_h_metrics_raw: [(u16, i16); 128] = std::array::from_fn(|i| {
+            let tid = owned_ttf_parser::GlyphId(ascii_glyph_ids[i].0);
+            (
+                face.glyph_hor_advance(tid).unwrap_or(0),
+                face.glyph_hor_side_bearing(tid).unwrap_or(0),
+            )
+        });
+        let has_kern = face.tables().kern.is_some();
+        Font {
+            font,
+            scale_factor,
+            ascii_glyph_ids,
+            ascii_h_metrics_raw,
+            has_kern,
+            ascii_kern_raw: std::cell::RefCell::new(None),
+            glyph_cache: Default::default(),
+        }
+    }
+
     fn from_resource_file(filename: &str) -> Font {
         let mut bytes = Vec::new();
         let path = format!("{}/{}", paths::FONTS_DIR, filename);
@@ -115,15 +193,11 @@ impl Font {
             panic!("Couldn't parse bundled font file {path:?}. This probably means the file is corrupt. Try re-downloading it.");
         };
 
-        Font {
-            glyph_cache: Default::default(),
-            font,
-            // TODO: Make this a lookup based on the actual font
-            // iPhone OS's interpretation of font size is slightly different,
-            // when substituting Helvetica with our Liberation font.
-            // This scale factor has been eyeball'd, it's not exact.
-            scale_factor: 1.125,
-        }
+        // TODO: Make this a lookup based on the actual font
+        // iPhone OS's interpretation of font size is slightly different,
+        // when substituting Helvetica with our Liberation font.
+        // This scale factor has been eyeball'd, it's not exact.
+        Self::from_rusttype(font, 1.125)
     }
 
     pub fn from_vec(bytes: Vec<u8>) -> Font {
@@ -131,11 +205,7 @@ impl Font {
             panic!("Couldn't parse font bytes.");
         };
 
-        Font {
-            glyph_cache: Default::default(),
-            font,
-            scale_factor: 1.0, // No scale factor
-        }
+        Self::from_rusttype(font, 1.0) // No scale factor
     }
 
     pub fn mono_regular() -> Font {
@@ -250,6 +320,51 @@ impl Font {
         (v_metrics.ascent - v_metrics.descent, v_metrics.line_gap)
     }
 
+    #[inline]
+    fn pair_kerning_fast(
+        &self,
+        factor: f32,
+        scale: Scale,
+        last: (GlyphId, Option<u8>),
+        cur_gid: GlyphId,
+        cur_ascii: Option<u8>,
+    ) -> f32 {
+        if !self.has_kern {
+            return 0.0;
+        }
+        if let (Some(a), Some(b)) = (last.1, cur_ascii) {
+            let mut slot_ref = self.ascii_kern_raw.borrow_mut();
+            let table = slot_ref.get_or_insert_with(|| Box::new([i32::MIN; 128 * 128]));
+            let idx = (a as usize) * 128 + (b as usize);
+            let cached = table[idx];
+            let raw = if cached != i32::MIN {
+                cached
+            } else {
+                let k = self
+                    .as_face_ref()
+                    .tables()
+                    .kern
+                    .and_then(|kern| {
+                        kern.subtables
+                            .into_iter()
+                            .filter(|st| st.horizontal && !st.variable)
+                            .find_map(|st| {
+                                st.glyphs_kerning(
+                                    owned_ttf_parser::GlyphId(last.0 .0),
+                                    owned_ttf_parser::GlyphId(cur_gid.0),
+                                )
+                            })
+                    })
+                    .unwrap_or(0) as i32;
+                table[idx] = k;
+                k
+            };
+            factor * (raw as f32)
+        } else {
+            self.font.pair_kerning(scale, last.0, cur_gid)
+        }
+    }
+
     /// n72 fork: rusttype's `layout` without positioning each glyph. Same
     /// caret, kerning and advance maths as its LayoutIter, but `positioned()`
     /// computes the glyph's pixel bounds, which in ttf-parser walks the whole
@@ -259,21 +374,35 @@ impl Font {
         text: &'s str,
         scale: Scale,
         start: Point<f32>,
-    ) -> impl Iterator<Item = (rusttype::ScaledGlyph<'static>, Point<f32>)> + 's {
+    ) -> impl Iterator<Item = (GlyphId, f32, f32, Point<f32>)> + 's {
+        let factor = if scale.x == scale.y {
+            self.font.scale_for_pixel_height(scale.y)
+        } else {
+            self.font.scale_for_pixel_height(scale.y) * (scale.x / scale.y)
+        };
         let mut caret = 0.0f32;
-        let mut last: Option<GlyphId> = None;
+        let mut last: Option<(GlyphId, Option<u8>)> = None;
         text.chars().map(move |c| {
-            let g = self.font.glyph(c).scaled(scale);
+            let (gid, adv, lsb, ascii) = if (c as u32) < 128 {
+                let b = c as u8;
+                let gid = self.ascii_glyph_ids[b as usize];
+                let (raw_adv, raw_lsb) = self.ascii_h_metrics_raw[b as usize];
+                (gid, (raw_adv as f32) * factor, (raw_lsb as f32) * factor, Some(b))
+            } else {
+                let g = self.font.glyph(c).scaled(scale);
+                let hm = g.h_metrics();
+                (g.id(), hm.advance_width, hm.left_side_bearing, None)
+            };
             if let Some(l) = last {
-                caret += self.font.pair_kerning(scale, l, g.id());
+                caret += self.pair_kerning_fast(factor, scale, l, gid, ascii);
             }
             let p = Point {
                 x: start.x + caret,
                 y: start.y,
             };
-            caret += g.h_metrics().advance_width;
-            last = Some(g.id());
-            (g, p)
+            caret += adv;
+            last = Some((gid, ascii));
+            (gid, adv, lsb, p)
         })
     }
 
@@ -282,18 +411,16 @@ impl Font {
         let mut line_x_min: f32 = 0.0;
         let mut line_x_max: f32 = 0.0;
 
-        for (glyph, position) in
+        for (_gid, advance_width, left_side_bearing, position) in
             self.layout_unpositioned(line, self.scale(font_size), Default::default())
         {
-            let h_metrics = glyph.h_metrics();
-
             // This method used to use pixel_bounding_box() for metrics, but
             // now uses h_metrics() in order to support whitespace characters.
             // This definition of character width was chosen because it gave
             // similar results to the old implementation, not because it's
             // optimal; maybe it could be improved.
-            let glyph_x_min = position.x.min(position.x + h_metrics.left_side_bearing);
-            let glyph_x_max = position.x + h_metrics.advance_width;
+            let glyph_x_min = position.x.min(position.x + left_side_bearing);
+            let glyph_x_max = position.x + advance_width;
 
             line_x_min = line_x_min.min(glyph_x_min);
             line_x_min = line_x_min.min(glyph_x_max);
@@ -425,6 +552,15 @@ impl Font {
         lines
     }
 
+    fn text_size_for_lines(lines: &[(f32, &str)], line_height: f32, line_gap: f32) -> (f32, f32) {
+        let width = lines
+            .iter()
+            .fold(0f32, |widest, &(line_width, _line)| widest.max(line_width));
+        let height =
+            line_height * (lines.len() as f32) + line_gap * (lines.len().saturating_sub(1) as f32);
+        (width, height)
+    }
+
     /// Calculate the on-screen width and height of text with a given font size.
     pub fn calculate_text_size(
         &self,
@@ -433,20 +569,13 @@ impl Font {
         wrap: Option<(f32, WrapMode)>,
     ) -> (f32, f32) {
         let lines = self.break_lines(font_size, text, wrap);
-
-        let width = lines
-            .iter()
-            .fold(0f32, |widest, &(line_width, _line)| widest.max(line_width));
         let (line_height, line_gap) = self.line_height_and_gap(font_size);
-        let height =
-            line_height * (lines.len() as f32) + line_gap * (lines.len().saturating_sub(1) as f32);
-
-        (width, height)
+        Self::text_size_for_lines(&lines, line_height, line_gap)
     }
 
-    /// Draw text. Calls the provided callback for each glyph that is to be
-    /// drawn. Assumes y starts at the top-left corner and points downwards.
-    /// Used by UIKit for font rendering.
+    /// Draw text and return its `(width, height)`. Calls the provided callback
+    /// for each glyph that is to be drawn. Assumes y starts at the top-left
+    /// corner and points downwards. Used by UIKit for font rendering.
     pub fn draw<F: FnMut(RasterGlyph)>(
         &self,
         font_size: f32,
@@ -455,11 +584,14 @@ impl Font {
         wrap: Option<(f32, WrapMode)>,
         alignment: TextAlignment,
         mut draw_glyph: F,
-    ) {
+    ) -> (f32, f32) {
         let lines = self.break_lines(font_size, text, wrap);
 
-        let mut baseline = origin.1 + self.v_metrics_scaled(font_size).ascent;
+        let scale = self.scale(font_size);
+        let scale_bits = scale.x.to_bits();
+        let mut baseline = origin.1 + self.font.v_metrics(scale).ascent;
         let (line_height, line_gap) = self.line_height_and_gap(font_size);
+        let text_size = Self::text_size_for_lines(&lines, line_height, line_gap);
 
         let mut cache = self.glyph_cache.borrow_mut();
 
@@ -469,9 +601,9 @@ impl Font {
                 TextAlignment::Center => -line_width / 2.0,
                 TextAlignment::Right => -line_width,
             };
-            for (glyph, pos) in self.layout_unpositioned(
+            for (gid, _adv, _lsb, pos) in self.layout_unpositioned(
                 line_text,
-                self.scale(font_size),
+                scale,
                 Point {
                     x: origin.0 + line_x_offset,
                     y: baseline,
@@ -482,12 +614,12 @@ impl Font {
                 let (ix, iy) = (pos.x.floor(), pos.y.floor());
                 let qx = ((pos.x - ix) * 4.0).round() as u8; // 0..=4
                 let qy = ((pos.y - iy) * 4.0).round() as u8;
-                let key: GlyphKey = (glyph.id().0, glyph.scale().x.to_bits(), qx, qy);
+                let key: GlyphKey = (gid.0, scale_bits, qx, qy);
                 if cache.map.len() >= GlyphCache::MAX_ENTRIES {
                     cache.map.clear();
                 }
                 let cached = cache.map.entry(key).or_insert_with(|| {
-                    let snapped = glyph.clone().positioned(Point {
+                    let snapped = self.font.glyph(gid).scaled(scale).positioned(Point {
                         x: qx as f32 / 4.0,
                         y: qy as f32 / 4.0,
                     });
@@ -526,6 +658,7 @@ impl Font {
             }
             baseline += line_height + line_gap;
         }
+        text_size
     }
 
     /// Draw glyphs. Similar to [Self::draw], but uses raw glyph ids instead of
@@ -680,6 +813,70 @@ impl Font {
             };
 
             draw_glyph(raster_glyph);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_ascii_layout_and_size_match_rusttype() {
+    let font = Font::sans_regular();
+    let samples = [
+        "AVATAR To Wa 0123456789.,!?:;-+()[] ",
+        "Watermelon Topaz AVA",
+        "Café naïve — € 100%",
+        "Line one wraps nicely across multiple words for testing To Wa AV.",
+    ];
+    for &size in &[10.0f32, 14.0, 18.5] {
+        let scale = font.scale(size);
+        for &text in &samples {
+            // 1. Direct rusttype layout must match layout_unpositioned bit-for-bit.
+            let mut rt_caret = 0.0f32;
+            let mut rt_last: Option<GlyphId> = None;
+            let expected: Vec<(GlyphId, f32, f32, f32)> = text
+                .chars()
+                .map(|c| {
+                    let g = font.font.glyph(c).scaled(scale);
+                    if let Some(l) = rt_last {
+                        rt_caret += font.font.pair_kerning(scale, l, g.id());
+                    }
+                    let hm = g.h_metrics();
+                    let px = 3.25 + rt_caret;
+                    rt_caret += hm.advance_width;
+                    rt_last = Some(g.id());
+                    (g.id(), hm.advance_width, hm.left_side_bearing, px)
+                })
+                .collect();
+
+            let actual: Vec<(GlyphId, f32, f32, f32)> = font
+                .layout_unpositioned(text, scale, Point { x: 3.25, y: 10.0 })
+                .map(|(gid, adv, lsb, pos)| (gid, adv, lsb, pos.x))
+                .collect();
+            assert_eq!(actual.len(), expected.len());
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.0, e.0, "gid mismatch at {i} for {text:?} size {size}");
+                assert!(
+                    (a.1 - e.1).abs() <= 1e-6 && (a.2 - e.2).abs() <= 1e-6 && (a.3 - e.3).abs() <= 1e-5,
+                    "metric/pos mismatch at {i} for {text:?} size {size}: {a:?} vs {e:?}"
+                );
+            }
+
+            // 2. draw() must return exact calculate_text_size() and produce
+            // consistent glyph origins/dimensions across repeated calls (cache hit).
+            for wrap in [None, Some((120.0, WrapMode::Word))] {
+                let sz_calc = font.calculate_text_size(size, text, wrap);
+                let mut g1 = Vec::new();
+                let sz_draw1 = font.draw(size, text, (5.5, 8.0), wrap, TextAlignment::Center, |rg| {
+                    g1.push((rg.origin(), rg.dimensions(), rg.pixels().len()));
+                });
+                let mut g2 = Vec::new();
+                let sz_draw2 = font.draw(size, text, (5.5, 8.0), wrap, TextAlignment::Center, |rg| {
+                    g2.push((rg.origin(), rg.dimensions(), rg.pixels().len()));
+                });
+                assert_eq!(sz_draw1, sz_calc);
+                assert_eq!(sz_draw2, sz_calc);
+                assert_eq!(g1, g2);
+            }
         }
     }
 }

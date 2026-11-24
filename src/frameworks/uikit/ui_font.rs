@@ -357,13 +357,11 @@ pub fn draw_at_point(
     let width_and_line_break_mode =
         width_and_line_break_mode.map(|(width, ui_mode)| (width, convert_line_break_mode(ui_mode)));
     let clip_x = width_and_line_break_mode.map(|(width, _)| point.x..(point.x + width));
-    let (width, height) =
-        font.calculate_text_size(host_object.size, text, width_and_line_break_mode);
 
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
 
-    font.draw(
+    let (width, height) = font.draw(
         host_object.size,
         text,
         (point.x, point.y),
@@ -394,8 +392,6 @@ pub fn draw_in_rect(
 ) -> CGSize {
     let context = UIGraphicsGetCurrentContext(env);
 
-    let text_size = size_with_font(env, font, text, Some((rect.size, line_break_mode)));
-
     let host_object = env.objc.borrow::<UIFontHostObject>(font);
 
     let font = get_font(
@@ -414,7 +410,7 @@ pub fn draw_in_rect(
         _ => unimplemented!(),
     };
 
-    font.draw(
+    let (width, height) = font.draw(
         host_object.size,
         text,
         (rect.origin.x + origin_x_offset, rect.origin.y),
@@ -431,7 +427,10 @@ pub fn draw_in_rect(
         },
     );
 
-    text_size
+    CGSize {
+        width,
+        height,
+    }
 }
 
 fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
