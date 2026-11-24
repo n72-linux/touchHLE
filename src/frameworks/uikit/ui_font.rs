@@ -307,15 +307,22 @@ pub fn draw_font_glyph(
         }
     }
 
+    crate::frameworks::core_graphics::cg_bitmap_context::n72_cg_stats::op("text");
+    // n72 fork: a pixel the glyph does not cover blends a fully transparent
+    // colour, which in the normal blend mode leaves it as it is: not touched
+    // at all (a read-blend-write would round it through the gamma tables).
+    let skip_uncovered = drawer.blends_normally();
     for ((x, y), (tex_x, tex_y)) in drawer.iter_transformed_pixels(glyph_rect) {
         // TODO: bilinear sampling
         let coverage = raster_glyph.pixel_at((
             (tex_x * glyph_rect.size.width - 0.5).round() as i32,
             (tex_y * glyph_rect.size.height - 0.5).round() as i32,
         ));
+        if coverage == 0.0 && skip_uncovered {
+            continue;
+        }
         let (r, g, b, a) = fill_color;
         let (r, g, b, a) = (r * coverage, g * coverage, b * coverage, a * coverage);
-        crate::frameworks::core_graphics::cg_bitmap_context::n72_cg_stats::op("text");
         drawer.put_pixel((x, y), (r, g, b, a), /* blend: */ true);
     }
 }

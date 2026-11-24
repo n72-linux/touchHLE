@@ -467,6 +467,11 @@ impl CGBitmapContextDrawer<'_> {
             self.rgb_fill_color.3, // alpha is always linear
         )
     }
+    /// n72 fork: whether blending a fully transparent colour leaves a pixel
+    /// as it is (the normal blend mode).
+    pub fn blends_normally(&self) -> bool {
+        self.blend_mode == kCGBlendModeNormal
+    }
     /// Set the pixel at `coords` to `color`. `color` must be linear RGB, not
     /// sRGB! Note that `coords` are absolute: you must do transformation
     /// yourself.
@@ -803,6 +808,13 @@ pub(crate) mod n72_cg_stats {
         since: Instant,
     }
 
+    /// N72_CG_STATS, read once: when it is off (always, outside profiling)
+    /// the per-pixel count is one load, not a thread-local lookup.
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("N72_CG_STATS").is_some())
+    }
+
     thread_local! {
         static STATS: RefCell<Stats> = RefCell::new(Stats {
             on: std::env::var_os("N72_CG_STATS").is_some(),
@@ -813,6 +825,9 @@ pub(crate) mod n72_cg_stats {
     }
 
     pub fn op(name: &'static str) {
+        if !on() {
+            return;
+        }
         STATS.with(|s| {
             let mut s = s.borrow_mut();
             if !s.on {
@@ -826,7 +841,11 @@ pub(crate) mod n72_cg_stats {
         })
     }
 
+    #[inline]
     pub fn count(pixels: u64) {
+        if !on() {
+            return;
+        }
         STATS.with(|s| {
             let mut s = s.borrow_mut();
             if !s.on {
