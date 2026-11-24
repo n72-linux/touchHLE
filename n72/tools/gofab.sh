@@ -148,12 +148,13 @@ while [ $r -le $N ]; do
 		if grep -qE 'panicked|assertion|Segmentation|SIGSEGV|Illegal' $d/log; then
 			echo "$name: the log shows a crash, stopping"; grep -m3 -E 'panicked|assertion' $d/log; restore; exit 1
 		fi
-		k=$(dmesg | tail -n +$(( $(cat $OUT/dmesg.start) + 1 )))
-		if echo "$k" | grep -qiE 'oops|bug:|warning:|hung task|watchdog|mbx|drm|out of memory|segfault'; then
-			echo "kernel warning, stopping:"; echo "$k" | tail -5; restore; exit 1
+		kl=$(dmesg | tail -n +$(( $(cat $OUT/dmesg.start) + 1 )) | grep -v 'n72-tapd virtual touchscreen')
+		# stop on what is wrong, not on the drivers' info lines ("apple-mbx ...: VGP program: 255 words")
+		if echo "$kl" | grep -qiE 'oops|bug:|warning:|hung task|watchdog|out of memory|segfault|(mbx|drm).*(error|fail|timeout|timed out|reset|fault|hang|lockup|full)'; then
+			echo "kernel warning, stopping:"; echo "$kl" | tail -5; restore; exit 1
 		fi
 		# other new kernel lines (an i2c timeout, a touch controller reload): noted, not a stop
-		[ -n "$k" ] && { echo "$k" > $d/dmesg.txt; echo "note: $(echo "$k" | wc -l) new kernel lines, in $d/dmesg.txt"; }
+		[ -n "$kl" ] && { echo "$kl" > $d/dmesg.txt; echo "note: $(echo "$kl" | wc -l) new kernel lines, in $d/dmesg.txt"; }
 		dmesg | wc -l > $OUT/dmesg.start
 		sleep 2
 	done
