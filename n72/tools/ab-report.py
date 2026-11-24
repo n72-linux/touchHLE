@@ -2,8 +2,8 @@
 """ab-report.py RESULTS.tsv [BASELINE]: gofab.sh's runs as a table per route and variant.
 
 Per variant: runs, the median of the runs' median FPS, the range of the run medians, the
-busiest thread's CPU ms a frame (the game's main thread), the other threads', GPU TA and
-render us a frame (apple-mbx, over the window). Against BASELINE (default: the first
+busiest thread's CPU ms a frame (the game's main thread), the other threads', GPU scenes
+a frame and TA and render ms a frame (apple-mbx, over the window). Against BASELINE (default: the first
 variant): the change of the median, and whether the two ranges of run medians are apart
 ("apart": every run of one faster than every run of the other; with 3+ runs each that is
 worth believing, with fewer it is a hint). Several files: give them in turn."""
@@ -33,7 +33,7 @@ def main():
     for route, vs in by.items():
         base = names[0] if names and names[0] in vs else next(iter(vs))
         print('%s (baseline %s)' % (route, base))
-        print('  %-18s %4s %7s %15s %8s %8s %7s %7s  %s' % ('variant', 'runs', 'FPS', 'run medians', 'main ms', 'other', 'TA us', 'rnd us', 'vs baseline'))
+        print('  %-18s %4s %7s %15s %8s %6s %7s %6s %7s  %s' % ('variant', 'runs', 'FPS', 'run medians', 'main ms', 'other', 'scenes', 'TA ms', 'rnd ms', 'vs baseline'))
         bm = [float(r['fps_med']) for r in vs[base]]
         for name, rs in vs.items():
             m = [float(r['fps_med']) for r in rs]
@@ -44,9 +44,10 @@ def main():
                 d = (statistics.median(m) / statistics.median(bm) - 1) * 100
                 apart = min(m) > max(bm) or max(m) < min(bm)
                 cmp = '%+5.1f %%  %s' % (d, 'apart' if apart else 'overlap')
-            print('  %-18s %4d %7.2f %6.2f - %6.2f %8.1f %8.1f %7.0f %7.0f  %s' % (
+            g = lambda k: med(k) if k in rs[0] else float('nan')
+            print('  %-18s %4d %7.2f %6.2f - %6.2f %8.1f %6.1f %7.2f %6.1f %7.1f  %s' % (
                 name, len(rs), statistics.median(m), min(m), max(m),
-                med('main_ms_frame'), med('other_ms_frame'), med('ta_us'), med('render_us'), cmp))
+                med('main_ms_frame'), med('other_ms_frame'), g('scenes_frame'), g('ta_ms_frame'), g('render_ms_frame'), cmp))
         print()
 
 main()

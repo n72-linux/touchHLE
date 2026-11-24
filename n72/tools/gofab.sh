@@ -18,8 +18,9 @@
 #
 # Per run, in OUT/runs/<route>-<round>-<name>/: log, cpu.txt (thread CPU over the window),
 # gpu.txt. One line per run in OUT/results.tsv:
-#   route round name fps_med fps_min fps_max seconds main_ms_frame other_ms_frame ta_us render_us
-# main_ms_frame: the busiest thread's CPU time per frame (the game's), other: the rest together.
+#   route round name fps_med fps_min fps_max seconds main_ms_frame other_ms_frame scenes_frame ta_ms_frame render_ms_frame
+# main_ms_frame: the busiest thread's CPU time per frame (the game's), other: the rest together;
+# scenes_frame: GPU jobs (scenes) per frame; ta/render_ms_frame: GPU time per frame (apple-mbx).
 # OUT is /root/gof/ab/<date>-<route> (or $OUT). Stops at once on a kernel warning or a crash.
 R=$1; N=$2; V=$3
 [ -n "$R" ] && [ -n "$N" ] && [ -f "$V" ] || { sed -n '2,24p' "$0"; exit 2; }
@@ -87,7 +88,7 @@ done < $V
 	cat $OUT/variants.txt
 } > $OUT/info.txt
 cat $OUT/info.txt
-[ -f $OUT/results.tsv ] || echo "route	round	name	fps_med	fps_min	fps_max	seconds	main_ms_frame	other_ms_frame	ta_us	render_us" > $OUT/results.tsv
+[ -f $OUT/results.tsv ] || echo "route	round	name	fps_med	fps_min	fps_max	seconds	main_ms_frame	other_ms_frame	scenes_frame	ta_ms_frame	render_ms_frame" > $OUT/results.tsv
 
 pidof n72-ui >/dev/null && { rc-service n72-ui stop >/dev/null; sleep 1; }
 [ -f /root/gof/brightness.saved ] || cat /sys/class/backlight/*/brightness > /root/gof/brightness.saved
@@ -134,19 +135,26 @@ while [ $r -le $N ]; do
 		awk -v hz=$HZ -v fr=$frames 'NR == FNR {a[$1] = $3; next} {d = $3 - a[$1]; if (d > 0) printf "%s %s %.1f\n", $1, $2, (fr ? d * 1000 / hz / fr : 0)}' \
 			$d/cpu0 $d/cpu1 | sort -k3 -rn > $d/cpu.txt
 		main=$(awk 'NR == 1 {print $3}' $d/cpu.txt); other=$(awk 'NR > 1 {s += $3} END {printf "%.1f", s}' $d/cpu.txt)
+		j=$(echo "$g" | sed -n 's/.*read: \([0-9]*\),.*/\1/p')
 		ta=$(echo "$g" | sed -n 's/.*TA \([0-9]*\) us.*/\1/p'); rd=$(echo "$g" | sed -n 's/.*render \([0-9]*\) us.*/\1/p')
-		line=$(awk -v r=$R -v n=$r -v nm=$name -v m=${main:-0} -v o=${other:-0} -v ta=${ta:-0} -v rd=${rd:-0} \
-			'{v[NR] = $1} END {if (!NR) {printf "%s\t%s\t%s\t0\t0\t0\t0\t%s\t%s\t%s\t%s", r, n, nm, m, o, ta, rd; exit}
-			 printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s", r, n, nm, v[int((NR + 1) / 2)], v[1], v[NR], NR, m, o, ta, rd}' $d/fps.txt)
+		line=$(awk -v r=$R -v n=$r -v nm=$name -v m=${main:-0} -v o=${other:-0} -v j=${j:-0} -v ta=${ta:-0} -v rd=${rd:-0} -v fr=$frames \
+			'{v[NR] = $1} END {f = fr > 0 ? fr : 1
+			 if (!NR) {printf "%s\t%s\t%s\t0\t0\t0\t0\t%s\t%s\t0\t0\t0", r, n, nm, m, o; exit}
+			 printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%.2f\t%.1f\t%.1f", r, n, nm, v[int((NR + 1) / 2)], v[1], v[NR], NR, m, o,
+				j / f, j * ta / f / 1000, j * rd / f / 1000}' $d/fps.txt)
 		echo "$line" >> $OUT/results.tsv
 		echo "$line"
 		# warning signs: a crash in the log or new kernel warnings stop everything
 		if grep -qE 'panicked|assertion|Segmentation|SIGSEGV|Illegal' $d/log; then
 			echo "$name: the log shows a crash, stopping"; grep -m3 -E 'panicked|assertion' $d/log; restore; exit 1
 		fi
-		if dmesg | tail -n +$(( $(cat $OUT/dmesg.start) + 1 )) | grep -qiE 'oops|bug:|warning:|hung|timed out|timeout'; then
-			echo "kernel warning, stopping:"; dmesg | tail -n +$(( $(cat $OUT/dmesg.start) + 1 )) | tail -5; restore; exit 1
+		k=$(dmesg | tail -n +$(( $(cat $OUT/dmesg.start) + 1 )))
+		if echo "$k" | grep -qiE 'oops|bug:|warning:|hung task|watchdog|mbx|drm|out of memory|segfault'; then
+			echo "kernel warning, stopping:"; echo "$k" | tail -5; restore; exit 1
 		fi
+		# other new kernel lines (an i2c timeout, a touch controller reload): noted, not a stop
+		[ -n "$k" ] && { echo "$k" > $d/dmesg.txt; echo "note: $(echo "$k" | wc -l) new kernel lines, in $d/dmesg.txt"; }
+		dmesg | wc -l > $OUT/dmesg.start
 		sleep 2
 	done
 	r=$((r + 1))
