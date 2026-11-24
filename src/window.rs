@@ -299,6 +299,9 @@ impl Window {
     pub fn fixed_portrait_panel() -> bool {
         cfg!(feature = "cpu-native")
     }
+    pub fn scale_hack(&self) -> NonZeroU32 {
+        self.scale_hack
+    }
     pub fn new(
         title: &str,
         icon: Option<Image>,
@@ -1373,8 +1376,24 @@ impl Window {
         // are not shown (a page flip would fail: touchHLE is not the KMS
         // master then), and an app that keeps drawing is held to 30 frames a
         // second, so that it leaves the CPU to the player.
+        //
+        // The frame's scene must end all the same. n72-gles closes a scene
+        // only at eglSwapBuffers or glFlush/glFinish; without either, every
+        // frame drawn while the display is lent (the compositor's clear and
+        // layers, a game's whole frame in a window-backed renderbuffer) piles
+        // up in one scene, and the first swap afterwards hands the GPU
+        // hundreds of full-screen frames at once, more than the tile
+        // accelerator's parameter buffer holds (the movie hang of
+        // 2026-11-24). glFlush renders the frame into the back buffer,
+        // which nobody sees, as the swap would have without the flip.
         #[cfg(feature = "cpu-native")]
         if self.n72_display_lent {
+            static GL_FLUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let flush = *GL_FLUSH.get_or_init(|| self.gl_get_proc_address("glFlush") as usize);
+            if flush != 0 {
+                let flush: extern "C" fn() = unsafe { std::mem::transmute(flush) };
+                flush();
+            }
             let next = self.n72_last_lent_swap.get() + Duration::from_millis(33);
             let now = Instant::now();
             if next > now {
