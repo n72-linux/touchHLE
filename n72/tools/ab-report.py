@@ -48,6 +48,18 @@ def main():
             print('  %-18s %4d %7.2f %6.2f - %6.2f %8.1f %6.1f %7.2f %6.1f %7.1f  %s' % (
                 name, len(rs), statistics.median(m), min(m), max(m),
                 med('main_ms_frame'), med('other_ms_frame'), g('scenes_frame'), g('ta_ms_frame'), g('render_ms_frame'), cmp))
+        # runs drawn in the same number of scenes a frame side by side (the routing's choice
+        # and the frames' contents move a run between them)
+        if 'scenes_frame' in rows[0]:
+            buckets = collections.OrderedDict()
+            for name, rs in vs.items():
+                for r in rs:
+                    buckets.setdefault(round(float(r['scenes_frame'])), collections.OrderedDict()).setdefault(name, []).append(r)
+            if len(buckets) > 1:
+                print('  by scenes a frame:')
+                for sc in sorted(buckets):
+                    print('    %d: %s' % (sc, '  '.join('%s %s (%d)' % (n, '/'.join('%.1f' % float(r['fps_med']) for r in rr), len(rr))
+                                                       for n, rr in buckets[sc].items())))
         print()
 
 main()
