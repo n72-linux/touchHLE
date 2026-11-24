@@ -296,6 +296,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             unsafe { __llvm_profile_write_file() };
         }
     }
+    #[cfg(feature = "n72-prof")]
     if crate::dyld::n72_svc_stats_on() {
         static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -379,10 +380,31 @@ pub const CLASSES: ClassExports = objc_classes! {
                     if n72_is_window_backed(renderbuffer) {
                         set_layer_window_backed(env, drawable, true);
                         drop(super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread));
-                        if !crate::frameworks::core_animation::composite_eagl_overlays_to_window(
-                            env,
-                            &overlay_roots,
-                        ) {
+                        use crate::frameworks::core_animation as ca;
+                        if let Some(overlays) = ca::collect_eagl_overlays(env, &overlay_roots) {
+                            // The overlays are drawn with the app's context,
+                            // into its scene: a switch to touchHLE's internal
+                            // context would end the scene and cost a second
+                            // full-screen one (n72-gles' eglMakeCurrent).
+                            let gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                            // SAFETY: on the panel the GLES handle is
+                            // gles1_native's, which holds no reference (only
+                            // a lifetime); the context it stands for stays
+                            // current and alive while it is used here.
+                            let mut gles: Box<dyn crate::gles::GLES> = unsafe {
+                                std::mem::transmute::<Box<dyn crate::gles::GLES + '_>, Box<dyn crate::gles::GLES + 'static>>(gles)
+                            };
+                            let drawn = unsafe {
+                                ca::draw_eagl_overlays_in_app_ctx(env, gles.as_mut(), &overlays, renderbuffer)
+                            };
+                            drop(gles);
+                            if drawn {
+                                env.window.as_ref().unwrap().swap_window();
+                            } else {
+                                ca::composite_eagl_overlays_to_window(env, &overlays);
+                            }
+                            ca::finish_eagl_overlays(env, overlays);
+                        } else {
                             env.window.as_ref().unwrap().swap_window();
                         }
                         if let Some(sleep_for) = sleep_for {
@@ -516,6 +538,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// an interval's worth of accumulated slop. Allowing infinite accumulation of
 /// slop is not desirable, because if the game is running slowly for a long time
 /// and suddenly speeds back up, it will then run too fast for a long time.
+#[cfg(feature = "n72-prof")]
 /// n72 fork: exact CPU time of every host thread per frame (N72_SVC_STATS=1),
 /// from the scheduler's per-thread clocks. `/proc`'s utime and stime are
 /// samples taken at the timer tick, and the per-thread clocks of another
@@ -558,6 +581,7 @@ fn n72_thread_report(frames: u32) {
     *last = now;
 }
 
+#[cfg(feature = "n72-prof")]
 /// n72 fork: the calling (main) thread's hardware counters per frame, where
 /// the kernel has perf events (a test kernel; an empty string otherwise):
 /// cycles, instructions and instruction cache misses, the ARM1176's events
@@ -774,9 +798,6 @@ fn n72_is_window_backed(renderbuffer: GLuint) -> bool {
 }
 
 unsafe fn n72_set_window_backed(gles: &mut dyn GLES, renderbuffer: GLuint, on: bool) {
-    if std::env::var_os("N72_WINDOW_BACKED").is_some_and(|v| v == "0") {
-        return;
-    }
     let f = N72_WINDOW_BACKED_FN.load(std::sync::atomic::Ordering::Relaxed);
     if f <= 1 {
         return;

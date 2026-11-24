@@ -142,6 +142,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         .collect();
 
     // n72 fork, debugging aid: dump the layer trees once, at the 60th frame.
+    #[cfg(feature = "n72-prof")]
     {
         static N72_DUMP_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if std::env::var_os("N72_LAYER_DUMP").is_some()
@@ -343,14 +344,20 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     new_recomposite_next
 }
 
-/// n72 fork: blend only the visible on-screen overlay layers (sublayers / later
-/// siblings of a window-backed `CAEAGLLayer`) directly onto `FRAMEBUFFER_OES = 0`
-/// without clearing or copying the base layer, then swap the window.
-///
-/// Returns `true` if overlays were drawn and the window was swapped, or `false`
-/// if no overlay had drawable on-screen content (the caller can then simply
-/// `swap_window()` on the app's context without opening a second GPU scene).
-pub fn composite_eagl_overlays_to_window(env: &mut Environment, overlay_roots: &[id]) -> bool {
+/// n72 fork: the visible on-screen overlay layers (sublayers / later siblings
+/// of a window-backed `CAEAGLLayer`) of one frame, collected before any GL
+/// call. Hand it to [draw_eagl_overlays_in_app_ctx] or
+/// [composite_eagl_overlays_to_window], then to [finish_eagl_overlays].
+pub struct EaglOverlays {
+    animation_state: animation::State,
+    draw_list: Vec<(id, CALayerHostObject, Matrix<4>, CGFloat)>,
+    screen_bounds: CGRect,
+}
+
+/// n72 fork: collect the frame's overlays; `None` (animations already
+/// finished) if none of them has drawable on-screen content, so the caller can
+/// simply `swap_window()` on the app's context.
+pub fn collect_eagl_overlays(env: &mut Environment, overlay_roots: &[id]) -> Option<EaglOverlays> {
     let mut animation_state = animation::State::default();
     for &root in overlay_roots {
         display_layers(env, root);
@@ -419,49 +426,77 @@ pub fn composite_eagl_overlays_to_window(env: &mut Environment, overlay_roots: &
 
     if draw_list.is_empty() {
         animation_state.update_started_and_finished_animations(env);
-        return false;
+        return None;
     }
+    Some(EaglOverlays {
+        animation_state,
+        draw_list,
+        screen_bounds,
+    })
+}
 
-    let fb_width = screen_bounds.size.width as u32;
-    let fb_height = screen_bounds.size.height as u32;
+/// n72 fork: end of the frame's overlays (animation bookkeeping).
+pub fn finish_eagl_overlays(env: &mut Environment, overlays: EaglOverlays) {
+    overlays.animation_state.update_started_and_finished_animations(env);
+}
+
+/// n72 fork: draw the overlays with the clean 2D state set up here, into
+/// whatever framebuffer is bound (it must be the panel's back buffer).
+unsafe fn draw_eagl_overlays(
+    objc: &mut ObjC,
+    mem: &crate::mem::Mem,
+    misc_slot: &mut Option<MiscGlObjects>,
+    gles: &mut dyn GLES,
+    overlays: &EaglOverlays,
+) {
+    let screen_bounds = overlays.screen_bounds;
+    let misc_gl_objects = ensure_misc_gl_objects(misc_slot, gles);
+    gles.Viewport(0, 0, screen_bounds.size.width as _, screen_bounds.size.height as _);
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    gles.MatrixMode(gles11::PROJECTION);
+    load_matrix(
+        gles,
+        Matrix::from(&Matrix::scale_2d(
+            2.0 / screen_bounds.size.width,
+            -2.0 / screen_bounds.size.height,
+        ))
+        .multiply(&Matrix::translate_3d(-1.0, 1.0, 0.0)),
+    );
+    gles.MatrixMode(gles11::MODELVIEW);
+    gles.LoadIdentity();
+    gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, misc_gl_objects.index_buffer);
+    for (layer, host_obj, quad_matrix, opacity) in &overlays.draw_list {
+        draw_layer_content(
+            objc,
+            mem,
+            misc_gl_objects,
+            gles,
+            *layer,
+            host_obj,
+            quad_matrix,
+            *opacity,
+        );
+    }
+}
+
+/// n72 fork: blend the overlays onto `FRAMEBUFFER_OES = 0` of touchHLE's
+/// internal context, without clearing or copying the base layer, then swap
+/// the window. Switching contexts ends the app's GPU scene, so this costs a
+/// second full-screen scene: [draw_eagl_overlays_in_app_ctx] is preferred.
+pub fn composite_eagl_overlays_to_window(env: &mut Environment, overlays: &EaglOverlays) {
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
-    let misc_gl_objects = ensure_misc_gl_objects(
-        &mut env.framework_state.core_animation.composition.misc_gl_objects,
-        gles.as_mut(),
-    );
-
     unsafe {
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
-        gles.Viewport(0, 0, fb_width as _, fb_height as _);
-        gles.Color4f(1.0, 1.0, 1.0, 1.0);
-        gles.MatrixMode(gles11::PROJECTION);
-        load_matrix(
+        draw_eagl_overlays(
+            &mut env.objc,
+            &env.mem,
+            &mut env.framework_state.core_animation.composition.misc_gl_objects,
             gles.as_mut(),
-            Matrix::from(&Matrix::scale_2d(
-                2.0 / screen_bounds.size.width,
-                -2.0 / screen_bounds.size.height,
-            ))
-            .multiply(&Matrix::translate_3d(-1.0, 1.0, 0.0)),
+            overlays,
         );
-        gles.MatrixMode(gles11::MODELVIEW);
-        gles.LoadIdentity();
-        gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, misc_gl_objects.index_buffer);
-
-        for (layer, host_obj, quad_matrix, opacity) in draw_list {
-            draw_layer_content(
-                &mut env.objc,
-                &env.mem,
-                misc_gl_objects,
-                gles.as_mut(),
-                layer,
-                &host_obj,
-                &quad_matrix,
-                opacity,
-            );
-        }
-
-        gles.Viewport(0, 0, fb_width as _, fb_height as _);
+        let screen_bounds = overlays.screen_bounds;
+        gles.Viewport(0, 0, screen_bounds.size.width as _, screen_bounds.size.height as _);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
         gles.Disable(gles11::BLEND);
         gles.MatrixMode(gles11::PROJECTION);
@@ -473,10 +508,193 @@ pub fn composite_eagl_overlays_to_window(env: &mut Environment, overlay_roots: &
         assert_eq!(gles.GetError(), 0);
     }
     std::mem::drop(gles);
-    window.swap_window();
+    env.window.as_ref().unwrap().swap_window();
+}
 
-    animation_state.update_started_and_finished_animations(env);
+/// n72 fork: draw the overlays with the app's own GL context, into the app's
+/// framebuffer bound now, whose colour attachment is the window-backed
+/// `renderbuffer` (the panel's back buffer): the overlays join the app's GPU
+/// scene instead of opening a second one. All of the app's GL state that the
+/// drawing touches or depends on is saved first and put back after; the
+/// app's error flag is left alone. Returns `false`, having drawn nothing, if
+/// the bound framebuffer does not draw into `renderbuffer`: the caller then
+/// uses [composite_eagl_overlays_to_window]. The caller swaps the window.
+pub unsafe fn draw_eagl_overlays_in_app_ctx(
+    env: &mut Environment,
+    gles: &mut dyn GLES,
+    overlays: &EaglOverlays,
+    renderbuffer: GLuint,
+) -> bool {
+    let fb = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES);
+    if fb == 0 {
+        return false;
+    }
+    let mut kind = 0;
+    let mut name = 0;
+    gles.GetFramebufferAttachmentParameterivOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_OES,
+        &mut kind,
+    );
+    gles.GetFramebufferAttachmentParameterivOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+        &mut name,
+    );
+    if kind as GLenum != gles11::RENDERBUFFER_OES || name as GLuint != renderbuffer {
+        return false;
+    }
+
+    // Everything the overlay drawing sets or reads (draw_eagl_overlays,
+    // draw_layer_content, ensure_misc_gl_objects, upload_rgba8_pixels).
+    const CAPS: [GLenum; 12] = [
+        gles11::DEPTH_TEST,
+        gles11::CULL_FACE,
+        gles11::LIGHTING,
+        gles11::FOG,
+        gles11::ALPHA_TEST,
+        gles11::SCISSOR_TEST,
+        gles11::BLEND,
+        gles11::COLOR_LOGIC_OP,
+        gles11::POLYGON_OFFSET_FILL,
+        gles11::CLIP_PLANE0,
+        gles11::COLOR_MATERIAL,
+        gles11::TEXTURE_2D, // unit 0 (made active first)
+    ];
+    const CLIENT: [GLenum; 5] = [
+        gles11::VERTEX_ARRAY,
+        gles11::TEXTURE_COORD_ARRAY, // client unit 0 (made active first)
+        gles11::COLOR_ARRAY,
+        gles11::NORMAL_ARRAY,
+        0x8B9C, // POINT_SIZE_ARRAY_OES
+    ];
+    let active_texture = get_int(gles, gles11::ACTIVE_TEXTURE);
+    let client_active_texture = get_int(gles, gles11::CLIENT_ACTIVE_TEXTURE);
+    gles.ActiveTexture(gles11::TEXTURE1);
+    let tex1_enabled = gles.IsEnabled(gles11::TEXTURE_2D);
+    gles.ActiveTexture(gles11::TEXTURE0);
+    gles.ClientActiveTexture(gles11::TEXTURE0);
+    let caps = CAPS.map(|cap| gles.IsEnabled(cap));
+    // glGetIntegerv: n72-gles' glIsEnabled does not take the client arrays
+    let client = CLIENT.map(|array| get_int(gles, array));
+    let viewport = get_ints::<4>(gles, gles11::VIEWPORT);
+    let blend_src = get_int(gles, gles11::BLEND_SRC);
+    let blend_dst = get_int(gles, gles11::BLEND_DST);
+    let mut color_mask = [0u8; 4];
+    gles.GetBooleanv(gles11::COLOR_WRITEMASK, color_mask.as_mut_ptr());
+    let mut depth_mask = 0u8;
+    gles.GetBooleanv(gles11::DEPTH_WRITEMASK, &mut depth_mask);
+    let color = get_floats::<4>(gles, gles11::CURRENT_COLOR);
+    let unpack_alignment = get_int(gles, gles11::UNPACK_ALIGNMENT);
+    let texture_2d = get_int(gles, gles11::TEXTURE_BINDING_2D);
+    let mut tex_env_mode = 0;
+    gles.GetTexEnviv(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, &mut tex_env_mode);
+    let array_buffer = get_int(gles, gles11::ARRAY_BUFFER_BINDING);
+    let element_array_buffer = get_int(gles, gles11::ELEMENT_ARRAY_BUFFER_BINDING);
+    let vertex_buffer = get_int(gles, gles11::VERTEX_ARRAY_BUFFER_BINDING);
+    let vertex_size = get_int(gles, gles11::VERTEX_ARRAY_SIZE);
+    let vertex_type = get_int(gles, gles11::VERTEX_ARRAY_TYPE);
+    let vertex_stride = get_int(gles, gles11::VERTEX_ARRAY_STRIDE);
+    let vertex_pointer = get_ptr(gles, gles11::VERTEX_ARRAY_POINTER);
+    let tex_coord_buffer = get_int(gles, gles11::TEXTURE_COORD_ARRAY_BUFFER_BINDING);
+    let tex_coord_size = get_int(gles, gles11::TEXTURE_COORD_ARRAY_SIZE);
+    let tex_coord_type = get_int(gles, gles11::TEXTURE_COORD_ARRAY_TYPE);
+    let tex_coord_stride = get_int(gles, gles11::TEXTURE_COORD_ARRAY_STRIDE);
+    let tex_coord_pointer = get_ptr(gles, gles11::TEXTURE_COORD_ARRAY_POINTER);
+    let matrix_mode = get_int(gles, gles11::MATRIX_MODE);
+    let projection = get_floats::<16>(gles, gles11::PROJECTION_MATRIX);
+    let modelview = get_floats::<16>(gles, gles11::MODELVIEW_MATRIX);
+    let texture_matrix = get_floats::<16>(gles, gles11::TEXTURE_MATRIX);
+
+    // A clean 2D state, as touchHLE's internal context has it.
+    for cap in CAPS {
+        gles.Disable(cap);
+    }
+    for array in CLIENT {
+        gles.DisableClientState(array);
+    }
+    gles.ActiveTexture(gles11::TEXTURE1);
+    gles.Disable(gles11::TEXTURE_2D);
+    gles.ActiveTexture(gles11::TEXTURE0);
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+    gles.DepthMask(gles11::FALSE);
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 4);
+    gles.TexEnvi(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, gles11::MODULATE as _);
+    gles.MatrixMode(gles11::TEXTURE);
+    gles.LoadIdentity();
+
+    draw_eagl_overlays(
+        &mut env.objc,
+        &env.mem,
+        &mut env.framework_state.core_animation.composition.misc_gl_objects,
+        gles,
+        overlays,
+    );
+
+    // The app's state back.
+    gles.MatrixMode(gles11::TEXTURE);
+    gles.LoadMatrixf(texture_matrix.as_ptr());
+    gles.MatrixMode(gles11::MODELVIEW);
+    gles.LoadMatrixf(modelview.as_ptr());
+    gles.MatrixMode(gles11::PROJECTION);
+    gles.LoadMatrixf(projection.as_ptr());
+    gles.MatrixMode(matrix_mode as _);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, tex_coord_buffer as _);
+    gles.TexCoordPointer(tex_coord_size, tex_coord_type as _, tex_coord_stride, tex_coord_pointer);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, vertex_buffer as _);
+    gles.VertexPointer(vertex_size, vertex_type as _, vertex_stride, vertex_pointer);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, array_buffer as _);
+    gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, element_array_buffer as _);
+    gles.TexEnvi(gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE, tex_env_mode);
+    gles.BindTexture(gles11::TEXTURE_2D, texture_2d as _);
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, unpack_alignment);
+    gles.Color4f(color[0], color[1], color[2], color[3]);
+    gles.DepthMask(depth_mask);
+    gles.ColorMask(color_mask[0], color_mask[1], color_mask[2], color_mask[3]);
+    gles.BlendFunc(blend_src as _, blend_dst as _);
+    gles.Viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    for (&array, &on) in CLIENT.iter().zip(client.iter()) {
+        if on != 0 {
+            gles.EnableClientState(array);
+        } else {
+            gles.DisableClientState(array);
+        }
+    }
+    for (&cap, &on) in CAPS.iter().zip(caps.iter()) {
+        if on != 0 {
+            gles.Enable(cap);
+        } else {
+            gles.Disable(cap);
+        }
+    }
+    if tex1_enabled != 0 {
+        gles.ActiveTexture(gles11::TEXTURE1);
+        gles.Enable(gles11::TEXTURE_2D);
+    }
+    gles.ActiveTexture(active_texture as _);
+    gles.ClientActiveTexture(client_active_texture as _);
     true
+}
+
+unsafe fn get_int(gles: &mut dyn GLES, pname: GLenum) -> GLint {
+    get_ints::<1>(gles, pname)[0]
+}
+unsafe fn get_ints<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLint; N] {
+    let mut res = [0; N];
+    gles.GetIntegerv(pname, res.as_mut_ptr());
+    res
+}
+unsafe fn get_floats<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLfloat; N] {
+    let mut res = [0.0; N];
+    gles.GetFloatv(pname, res.as_mut_ptr());
+    res
+}
+unsafe fn get_ptr(gles: &mut dyn GLES, pname: GLenum) -> *const GLvoid {
+    let mut ptr = std::ptr::null();
+    gles.GetPointerv(pname, &mut ptr);
+    ptr
 }
 
 fn ensure_misc_gl_objects<'a>(

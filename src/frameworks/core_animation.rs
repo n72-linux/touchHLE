@@ -18,7 +18,10 @@ pub mod ca_transaction;
 mod animation;
 mod composition;
 
-pub use composition::{composite_eagl_overlays_to_window, recomposite_if_necessary};
+pub use composition::{
+    collect_eagl_overlays, composite_eagl_overlays_to_window, draw_eagl_overlays_in_app_ctx,
+    finish_eagl_overlays, recomposite_if_necessary,
+};
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::time::CFTimeInterval;
