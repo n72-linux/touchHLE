@@ -28,7 +28,7 @@ for spec; do
 	/root/*|/usr/*) dh=$hle; mh=device ;;
 	*) f=$hle; [ -f "$f" ] || f=$W/$hle; [ -d "$f" ] && f=$f/touchHLE; [ -f "$f" ] || { echo "$name: no $hle"; exit 1; }
 	   mh=$(cd "$(dirname "$f")" && pwd)/touchHLE
-	   dh=$(awk -v m="$mh" '$2 == m {print $3; exit}' $S/hle.list 2>/dev/null)	# one copy per binary
+	   dh=; [ -f $S/hle.list ] && dh=$(awk -v m="$mh" '$2 == m {print $3; exit}' $S/hle.list)	# one copy per binary
 	   if [ -z "$dh" ]; then
 		mkdir -p $D/$name; ${CROSS}strip -o $D/$name/touchHLE "$f"; dh=$DEV/$name/touchHLE
 		echo "$name $mh $dh" >> $S/hle.list
