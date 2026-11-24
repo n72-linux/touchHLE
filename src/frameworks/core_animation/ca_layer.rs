@@ -61,6 +61,10 @@ pub(super) struct CALayerHostObject {
     /// a texture shared with the compositor's context (instead of
     /// `presented_pixels`): (texture, width, height).
     pub(super) presented_texture: Option<(crate::gles::gles11_raw::types::GLuint, u32, u32)>,
+    /// For CAEAGLLayer only, n72 fork: true while this layer's renderbuffer
+    /// draws straight into the panel's back buffer (so Core Animation must not
+    /// clear the window and composite a stale texture over it).
+    pub(super) n72_window_backed: bool,
     /// Internal, only exposed when calling `drawLayer:inContext:`
     pub(super) cg_context: Option<CGContextRef>,
     /// Internal state for compositor
@@ -137,6 +141,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         drawable_properties: nil,
         presented_pixels: None,
         presented_texture: None,
+        n72_window_backed: false,
         cg_context: None,
         gles_texture: None,
         gles_texture_is_up_to_date: false,

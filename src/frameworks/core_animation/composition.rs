@@ -10,7 +10,9 @@
 //! diverges wildly from what the real iPhone OS does.
 #![allow(clippy::zero_ptr)] // alas, as you know, opengl
 
-use super::ca_eagl_layer::find_fullscreen_eagl_layer;
+use super::ca_eagl_layer::{
+    find_fullscreen_eagl_base, find_fullscreen_eagl_layer, layer_is_window_backed,
+};
 use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
@@ -74,6 +76,15 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         // No composition done, EAGLContext will present directly.
         log_dbg!("Using CAEAGLLayer fast path, skipping composition");
         return None;
+    }
+
+    if let Some((base, _)) = find_fullscreen_eagl_base(env) {
+        if layer_is_window_backed(env, base) {
+            // EAGLContext renders directly to the window and composites
+            // overlays on presentRenderbuffer:.
+            log_dbg!("Using window-backed CAEAGLLayer overlay fast path, skipping composition");
+            return None;
+        }
     }
 
     if env.options.print_fps {
@@ -241,84 +252,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     };
 
     // Set up various other GL objects that will be reused on every frame.
-    let misc_gl_objects = env
-        .framework_state
-        .core_animation
-        .composition
-        .misc_gl_objects
-        .get_or_insert_with(|| {
-            let dimension = 512usize; // way larger than any reasonable corner
-            let mut image = Image::from_pixel_vec(
-                vec![255u8; dimension * dimension * 4],
-                (dimension as _, dimension as _),
-            );
-            image.round_corners(dimension as _, /* four_corners: */ false, /* add_sheen: */ false);
-
-            let mut rounded_corner_texture = 0;
-            unsafe {
-                gles.GenTextures(1, &mut rounded_corner_texture);
-                gles.BindTexture(gles11::TEXTURE_2D, rounded_corner_texture);
-                // GENERATE_MIPMAP must be set before the texture upload.
-                gles.TexParameteri(
-                    gles11::TEXTURE_2D,
-                    gles11::GENERATE_MIPMAP,
-                    gles11::TRUE as _,
-                );
-                upload_rgba8_pixels(gles.as_mut(), image.pixels(), (dimension as _, dimension as _));
-                gles.TexParameteri(
-                    gles11::TEXTURE_2D,
-                    gles11::TEXTURE_MIN_FILTER,
-                    gles11::LINEAR_MIPMAP_LINEAR as _,
-                );
-                gles.TexParameteri(
-                    gles11::TEXTURE_2D,
-                    gles11::TEXTURE_WRAP_S,
-                    gles11::CLAMP_TO_EDGE as _,
-                );
-                gles.TexParameteri(
-                    gles11::TEXTURE_2D,
-                    gles11::TEXTURE_WRAP_T,
-                    gles11::CLAMP_TO_EDGE as _,
-                );
-            }
-
-            let [basic_square_buffer, flipped_square_buffer, rounded_vertex_buffer, rounded_tex_coord_buffer, index_buffer] = unsafe {
-                let mut array_buffers = [0; 5];
-                gles.GenBuffers(5, array_buffers.as_mut_ptr());
-                array_buffers
-            };
-            unsafe {
-                gles.BindBuffer(gles11::ARRAY_BUFFER, basic_square_buffer);
-                upload_slice(gles.as_mut(), gles11::ARRAY_BUFFER, &BASIC_SQUARE_POINTS, gles11::STATIC_DRAW);
-                gles.BindBuffer(gles11::ARRAY_BUFFER, flipped_square_buffer);
-                upload_slice(gles.as_mut(), gles11::ARRAY_BUFFER, &FLIPPED_SQUARE_POINTS, gles11::STATIC_DRAW);
-                gles.BindBuffer(gles11::ARRAY_BUFFER, rounded_vertex_buffer);
-                upload_slice(gles.as_mut(), gles11::ARRAY_BUFFER, &[0f32; FLOATS_PER_9PATCH], gles11::DYNAMIC_DRAW);
-                gles.BindBuffer(gles11::ARRAY_BUFFER, rounded_tex_coord_buffer);
-                upload_slice(
-                    gles.as_mut(),
-                    gles11::ARRAY_BUFFER,
-                    &make_9patch_coords([0.0, 1.0, 1.0, 0.0], [0.0, 1.0, 1.0, 0.0]),
-                    gles11::STATIC_DRAW,
-                );
-                // Prevent accidental subsequent use.
-                gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
-
-                gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, index_buffer);
-                upload_slice(gles.as_mut(), gles11::ELEMENT_ARRAY_BUFFER, &make_9patch_indices(), gles11::STATIC_DRAW);
-                // Prevent accidental subsequent use.
-                gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, 0);
-            }
-
-            MiscGlObjects {
-                rounded_corner_texture,
-                basic_square_buffer,
-                flipped_square_buffer,
-                rounded_vertex_buffer,
-                rounded_tex_coord_buffer,
-                index_buffer,
-            }
-        });
+    let misc_gl_objects = ensure_misc_gl_objects(
+        &mut env.framework_state.core_animation.composition.misc_gl_objects,
+        gles.as_mut(),
+    );
 
     // Clear the framebuffer and set up state to prepare for rendering
     unsafe {
@@ -360,6 +297,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 root_layer,
                 cumulative_transform,
                 opacity,
+                screen_bounds,
             );
         }
     }
@@ -405,6 +343,259 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     new_recomposite_next
 }
 
+/// n72 fork: blend only the visible on-screen overlay layers (sublayers / later
+/// siblings of a window-backed `CAEAGLLayer`) directly onto `FRAMEBUFFER_OES = 0`
+/// without clearing or copying the base layer, then swap the window.
+///
+/// Returns `true` if overlays were drawn and the window was swapped, or `false`
+/// if no overlay had drawable on-screen content (the caller can then simply
+/// `swap_window()` on the app's context without opening a second GPU scene).
+pub fn composite_eagl_overlays_to_window(env: &mut Environment, overlay_roots: &[id]) -> bool {
+    let mut animation_state = animation::State::default();
+    for &root in overlay_roots {
+        display_layers(env, root);
+    }
+
+    let screen_bounds: CGRect = {
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        msg![env; screen bounds]
+    };
+
+    let mut draw_list: Vec<(id, CALayerHostObject, Matrix<4>, CGFloat)> = Vec::new();
+    fn collect_overlays(
+        env: &mut Environment,
+        animation_state: &mut animation::State,
+        layer: id,
+        cumulative_transform: Matrix<4>,
+        opacity: CGFloat,
+        screen_bounds: CGRect,
+        out: &mut Vec<(id, CALayerHostObject, Matrix<4>, CGFloat)>,
+    ) {
+        let host_obj = animation_state.create_presentation_layer(env, layer);
+        if host_obj.hidden {
+            return;
+        }
+        let opacity = opacity * host_obj.opacity;
+        let bounds = host_obj.bounds;
+        let cumulative_transform =
+            <Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform())
+                .multiply(&cumulative_transform);
+        let quad_matrix = Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
+            .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
+            .multiply(&cumulative_transform);
+        let sublayers = env.objc.borrow::<CALayerHostObject>(layer).sublayers.clone();
+        let has_content = host_obj.background_color.is_some()
+            || host_obj.presented_texture.is_some()
+            || host_obj.presented_pixels.is_some()
+            || host_obj.contents != nil
+            || host_obj.cg_context.is_some();
+        if opacity > 0.0 && has_content && quad_intersects_screen(&quad_matrix, screen_bounds) {
+            out.push((layer, host_obj, quad_matrix, opacity));
+        }
+        for child in sublayers {
+            collect_overlays(
+                env,
+                animation_state,
+                child,
+                cumulative_transform,
+                opacity,
+                screen_bounds,
+                out,
+            );
+        }
+    }
+
+    for &root in overlay_roots {
+        collect_overlays(
+            env,
+            &mut animation_state,
+            root,
+            Matrix::<4>::identity(),
+            1.0,
+            screen_bounds,
+            &mut draw_list,
+        );
+    }
+
+    if draw_list.is_empty() {
+        animation_state.update_started_and_finished_animations(env);
+        return false;
+    }
+
+    let fb_width = screen_bounds.size.width as u32;
+    let fb_height = screen_bounds.size.height as u32;
+    let window = env.window.as_mut().unwrap();
+    let mut gles = window.make_internal_gl_ctx_current();
+    let misc_gl_objects = ensure_misc_gl_objects(
+        &mut env.framework_state.core_animation.composition.misc_gl_objects,
+        gles.as_mut(),
+    );
+
+    unsafe {
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+        gles.Viewport(0, 0, fb_width as _, fb_height as _);
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
+        gles.MatrixMode(gles11::PROJECTION);
+        load_matrix(
+            gles.as_mut(),
+            Matrix::from(&Matrix::scale_2d(
+                2.0 / screen_bounds.size.width,
+                -2.0 / screen_bounds.size.height,
+            ))
+            .multiply(&Matrix::translate_3d(-1.0, 1.0, 0.0)),
+        );
+        gles.MatrixMode(gles11::MODELVIEW);
+        gles.LoadIdentity();
+        gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, misc_gl_objects.index_buffer);
+
+        for (layer, host_obj, quad_matrix, opacity) in draw_list {
+            draw_layer_content(
+                &mut env.objc,
+                &env.mem,
+                misc_gl_objects,
+                gles.as_mut(),
+                layer,
+                &host_obj,
+                &quad_matrix,
+                opacity,
+            );
+        }
+
+        gles.Viewport(0, 0, fb_width as _, fb_height as _);
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
+        gles.Disable(gles11::BLEND);
+        gles.MatrixMode(gles11::PROJECTION);
+        gles.LoadIdentity();
+        gles.MatrixMode(gles11::MODELVIEW);
+        gles.LoadIdentity();
+        gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+        gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, 0);
+        assert_eq!(gles.GetError(), 0);
+    }
+    std::mem::drop(gles);
+    window.swap_window();
+
+    animation_state.update_started_and_finished_animations(env);
+    true
+}
+
+fn ensure_misc_gl_objects<'a>(
+    slot: &'a mut Option<MiscGlObjects>,
+    gles: &mut dyn GLES,
+) -> &'a MiscGlObjects {
+    slot.get_or_insert_with(|| {
+        let dimension = 512usize; // way larger than any reasonable corner
+        let mut image = Image::from_pixel_vec(
+            vec![255u8; dimension * dimension * 4],
+            (dimension as _, dimension as _),
+        );
+        image.round_corners(
+            dimension as _,
+            /* four_corners: */ false,
+            /* add_sheen: */ false,
+        );
+
+        let mut rounded_corner_texture = 0;
+        unsafe {
+            gles.GenTextures(1, &mut rounded_corner_texture);
+            gles.BindTexture(gles11::TEXTURE_2D, rounded_corner_texture);
+            // GENERATE_MIPMAP must be set before the texture upload.
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::GENERATE_MIPMAP,
+                gles11::TRUE as _,
+            );
+            upload_rgba8_pixels(gles, image.pixels(), (dimension as _, dimension as _));
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR_MIPMAP_LINEAR as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+            gles.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as _,
+            );
+        }
+
+        let [basic_square_buffer, flipped_square_buffer, rounded_vertex_buffer, rounded_tex_coord_buffer, index_buffer] =
+            unsafe {
+                let mut array_buffers = [0; 5];
+                gles.GenBuffers(5, array_buffers.as_mut_ptr());
+                array_buffers
+            };
+        unsafe {
+            gles.BindBuffer(gles11::ARRAY_BUFFER, basic_square_buffer);
+            upload_slice(gles, gles11::ARRAY_BUFFER, &BASIC_SQUARE_POINTS, gles11::STATIC_DRAW);
+            gles.BindBuffer(gles11::ARRAY_BUFFER, flipped_square_buffer);
+            upload_slice(
+                gles,
+                gles11::ARRAY_BUFFER,
+                &FLIPPED_SQUARE_POINTS,
+                gles11::STATIC_DRAW,
+            );
+            gles.BindBuffer(gles11::ARRAY_BUFFER, rounded_vertex_buffer);
+            upload_slice(
+                gles,
+                gles11::ARRAY_BUFFER,
+                &[0f32; FLOATS_PER_9PATCH],
+                gles11::DYNAMIC_DRAW,
+            );
+            gles.BindBuffer(gles11::ARRAY_BUFFER, rounded_tex_coord_buffer);
+            upload_slice(
+                gles,
+                gles11::ARRAY_BUFFER,
+                &make_9patch_coords([0.0, 1.0, 1.0, 0.0], [0.0, 1.0, 1.0, 0.0]),
+                gles11::STATIC_DRAW,
+            );
+            // Prevent accidental subsequent use.
+            gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+
+            gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, index_buffer);
+            upload_slice(
+                gles,
+                gles11::ELEMENT_ARRAY_BUFFER,
+                &make_9patch_indices(),
+                gles11::STATIC_DRAW,
+            );
+            // Prevent accidental subsequent use.
+            gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, 0);
+        }
+
+        MiscGlObjects {
+            rounded_corner_texture,
+            basic_square_buffer,
+            flipped_square_buffer,
+            rounded_vertex_buffer,
+            rounded_tex_coord_buffer,
+            index_buffer,
+        }
+    })
+}
+
+fn quad_intersects_screen(quad_matrix: &Matrix<4>, screen_bounds: CGRect) -> bool {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &[u, v] in &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
+        let p = quad_matrix.transform([u, v, 0.0, 1.0]);
+        min_x = min_x.min(p[0]);
+        max_x = max_x.max(p[0]);
+        min_y = min_y.min(p[1]);
+        max_y = max_y.max(p[1]);
+    }
+    max_x > screen_bounds.origin.x
+        && min_x < screen_bounds.origin.x + screen_bounds.size.width
+        && max_y > screen_bounds.origin.y
+        && min_y < screen_bounds.origin.y + screen_bounds.size.height
+}
+
 /// Call `displayIfNeeded` on all relevant layers in the tree, so their bitmaps
 /// are up to date before compositing.
 fn display_layers(env: &mut Environment, root_layer: id) {
@@ -438,6 +629,7 @@ unsafe fn composite_layer_recursive(
     layer: id,
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
+    screen_bounds: CGRect,
 ) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
@@ -451,33 +643,18 @@ unsafe fn composite_layer_recursive(
         return;
     }
 
-    let window = env.window.as_mut().unwrap();
-    let mut gles = window.make_internal_gl_ctx_current();
-
     let opacity = opacity * host_obj.opacity;
-    let cumulative_transform = {
-        let CALayerHostObject { bounds, .. } = host_obj;
+    let bounds = host_obj.bounds;
+    let cumulative_transform =
+        <Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform())
+            .multiply(&cumulative_transform);
+    let quad_matrix = Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
+        .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
+        .multiply(&cumulative_transform);
 
-        // Update the transform to match this layer's co-ordinate space.
-        let cumulative_transform =
-            <Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform())
-                .multiply(&cumulative_transform);
-
-        // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
-        // so it will have the right size in this layer's co-ordinate space.
-        gles.MatrixMode(gles11::MODELVIEW);
-        load_matrix(
-            gles.as_mut(),
-            Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
-                .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
-                .multiply(&cumulative_transform),
-        );
-
-        cumulative_transform
-    };
-
-    // Draw background color, if any
-    let have_background = if let Some(background_color) = host_obj.background_color {
+    if opacity > 0.0 && quad_intersects_screen(&quad_matrix, screen_bounds) {
+        let window = env.window.as_mut().unwrap();
+        let mut gles = window.make_internal_gl_ctx_current();
         let misc = env
             .framework_state
             .core_animation
@@ -485,7 +662,52 @@ unsafe fn composite_layer_recursive(
             .misc_gl_objects
             .as_ref()
             .unwrap();
+        draw_layer_content(
+            &mut env.objc,
+            &env.mem,
+            misc,
+            gles.as_mut(),
+            layer,
+            &host_obj,
+            &quad_matrix,
+            opacity,
+        );
+        std::mem::drop(gles);
+    }
 
+    // avoid holding mutable borrow while recursing
+    let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    for &child_layer in &original_host_obj.sublayers.clone() {
+        // TODO: clipping/masksToBounds support
+        composite_layer_recursive(
+            env,
+            animation_state,
+            child_layer,
+            cumulative_transform,
+            opacity,
+            screen_bounds,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_layer_content(
+    objc: &mut ObjC,
+    mem: &crate::mem::Mem,
+    misc: &MiscGlObjects,
+    gles: &mut dyn GLES,
+    layer: id,
+    host_obj: &CALayerHostObject,
+    quad_matrix: &Matrix<4>,
+    opacity: CGFloat,
+) {
+    // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
+    // so it will have the right size in this layer's co-ordinate space.
+    gles.MatrixMode(gles11::MODELVIEW);
+    load_matrix(gles, *quad_matrix);
+
+    // Draw background color, if any
+    let have_background = if let Some(background_color) = host_obj.background_color {
         let CGColorHostObject { r, g, b, a, .. } = background_color;
         gles.Color4f(
             r * a * opacity,
@@ -521,7 +743,7 @@ unsafe fn composite_layer_recursive(
             gles.EnableClientState(gles11::VERTEX_ARRAY);
             gles.BindBuffer(gles11::ARRAY_BUFFER, misc.rounded_vertex_buffer);
             upload_slice(
-                gles.as_mut(),
+                gles,
                 gles11::ARRAY_BUFFER,
                 &make_9patch_coords(
                     [
@@ -575,13 +797,13 @@ unsafe fn composite_layer_recursive(
             gles.GenTextures(1, &mut texture);
             gles.BindTexture(gles11::TEXTURE_2D, texture);
             // Update original layer texture
-            env.objc.borrow_mut::<CALayerHostObject>(layer).gles_texture = Some(texture);
+            objc.borrow_mut::<CALayerHostObject>(layer).gles_texture = Some(texture);
         }
     }
 
     // Update original layer texture with CAEAGLLayer pixels (slow path), if any
     if need_update {
-        let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+        let original_host_obj = objc.borrow_mut::<CALayerHostObject>(layer);
         if let Some((ref mut pixels, width, height)) = original_host_obj.presented_pixels {
             // The pixels are always RGBA, but if the layer is opaque then the
             // alpha channel is meant to be ignored. glTexImage2D() has no
@@ -594,45 +816,36 @@ unsafe fn composite_layer_recursive(
                 }
             }
 
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            upload_rgba8_pixels(gles, pixels, (width, height));
         }
     }
 
     // Update texture with CGImageRef or CGContextRef pixels, if any
     if need_update {
         if host_obj.contents != nil {
-            let image = cg_image::borrow_image(&env.objc, host_obj.contents);
+            let image = cg_image::borrow_image(objc, host_obj.contents);
 
             // No special handling for opacity is needed here: the alpha channel
             // on an image is meaningful and won't be ignored.
-            upload_rgba8_pixels(gles.as_mut(), image.pixels(), image.dimensions());
+            upload_rgba8_pixels(gles, image.pixels(), image.dimensions());
         } else if let Some(cg_context) = host_obj.cg_context {
             // Make sure this is in sync with the code in ca_layer.rs that
             // sets up the context!
-            let (width, height, data) = cg_bitmap_context::get_data(&env.objc, cg_context);
+            let (width, height, data) = cg_bitmap_context::get_data(objc, cg_context);
             let size = width * height * 4;
-            let pixels = env.mem.bytes_at(data.cast(), size);
-            upload_rgba8_pixels(gles.as_mut(), pixels, (width, height));
+            let pixels = mem.bytes_at(data.cast(), size);
+            upload_rgba8_pixels(gles, pixels, (width, height));
         }
     }
 
     if need_update {
         // Update original layer field
-        env.objc
-            .borrow_mut::<CALayerHostObject>(layer)
+        objc.borrow_mut::<CALayerHostObject>(layer)
             .gles_texture_is_up_to_date = true;
     }
 
     // Draw texture, if any
     if need_texture {
-        let misc = env
-            .framework_state
-            .core_animation
-            .composition
-            .misc_gl_objects
-            .as_ref()
-            .unwrap();
-
         gles.Color4f(opacity, opacity, opacity, opacity);
         if opacity == 1.0 && host_obj.opaque && !have_background {
             gles.Disable(gles11::BLEND);
@@ -664,20 +877,6 @@ unsafe fn composite_layer_recursive(
             gles11::UNSIGNED_BYTE,
             0 as *const GLvoid,
         );
-    }
-    std::mem::drop(gles);
-
-    // avoid holding mutable borrow while recursing
-    let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
-    for &child_layer in &original_host_obj.sublayers.clone() {
-        // TODO: clipping/masksToBounds support
-        composite_layer_recursive(
-            env,
-            animation_state,
-            child_layer,
-            cumulative_transform,
-            opacity,
-        )
     }
 }
 

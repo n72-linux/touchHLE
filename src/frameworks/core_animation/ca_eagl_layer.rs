@@ -123,6 +123,122 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     layer
 }
 
+/// n72 fork: like [find_fullscreen_eagl_layer], but allows visible overlay
+/// layers (sublayers of the `CAEAGLLayer` or later siblings in the top window)
+/// on top of an opaque full-screen identity-transform `CAEAGLLayer`.
+///
+/// Returns `(eagl_layer, overlay_roots)` in back-to-front order so the
+/// `CAEAGLLayer` can stay window-backed and only its overlays are blended on
+/// top of the panel back buffer on present — avoiding the GPU copy + full-
+/// screen clear + 320x480 blit that Core Animation composition otherwise does
+/// (Spore's menu carries an 8x16 ticker tab and an off-screen ticker).
+pub fn find_fullscreen_eagl_base(env: &mut Environment) -> Option<(id, Vec<id>)> {
+    if env.options.force_composition
+        || !crate::window::Window::fixed_portrait_panel()
+        || env.options.scale_hack.get() != 1
+    {
+        return None;
+    }
+
+    let screen_bounds: CGRect = {
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        msg![env; screen bounds]
+    };
+
+    let window_ok = env.window.as_ref().is_some_and(|w| {
+        w.virtual_cursor_visible_at().is_none()
+            && w.viewport()
+                == (
+                    0,
+                    0,
+                    screen_bounds.size.width as u32,
+                    screen_bounds.size.height as u32,
+                )
+    });
+    if !window_ok {
+        return None;
+    }
+
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let top_window = windows
+        .into_iter()
+        .rev()
+        .find(|&window| !msg![env; window isHidden])?;
+
+    let root_layer: id = msg![env; top_window layer];
+    let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
+
+    fn is_fullscreen_identity(h: &CALayerHostObject, screen_bounds: CGRect) -> bool {
+        h.bounds.size == screen_bounds.size
+            && h.bounds.origin == (CGPoint { x: 0.0, y: 0.0 })
+            && h.anchor_point == (CGPoint { x: 0.5, y: 0.5 })
+            && h.position
+                == (CGPoint {
+                    x: screen_bounds.size.width / 2.0,
+                    y: screen_bounds.size.height / 2.0,
+                })
+            && !h.hidden
+            && h.opacity == 1.0
+            && h.affine_transform.is_identity()
+            && h.animations.is_empty()
+            && h.anonymous_animations.is_empty()
+    }
+
+    fn find_in(
+        env: &mut Environment,
+        layer: id,
+        screen_bounds: CGRect,
+        ca_eagl_layer_class: Class,
+    ) -> Option<(id, Vec<id>)> {
+        let (ok, opaque_plain, sublayers) = {
+            let h = env.objc.borrow::<CALayerHostObject>(layer);
+            (
+                is_fullscreen_identity(h, screen_bounds),
+                h.opaque && h.corner_radius == 0.0,
+                h.sublayers.clone(),
+            )
+        };
+        if !ok {
+            return None;
+        }
+        if opaque_plain && msg![env; layer isKindOfClass:ca_eagl_layer_class] {
+            return Some((layer, sublayers));
+        }
+        for idx in (0..sublayers.len()).rev() {
+            let child = sublayers[idx];
+            {
+                let h = env.objc.borrow::<CALayerHostObject>(child);
+                if h.hidden || h.opacity <= 0.0 {
+                    continue;
+                }
+            }
+            if let Some((base, mut overlays)) =
+                find_in(env, child, screen_bounds, ca_eagl_layer_class)
+            {
+                overlays.extend_from_slice(&sublayers[idx + 1..]);
+                return Some((base, overlays));
+            }
+        }
+        None
+    }
+
+    find_in(env, root_layer, screen_bounds, ca_eagl_layer_class)
+}
+
+/// n72 fork: whether this `CAEAGLLayer` currently renders straight into the
+/// window back buffer.
+pub fn layer_is_window_backed(env: &Environment, layer: id) -> bool {
+    env.objc.borrow::<CALayerHostObject>(layer).n72_window_backed
+}
+
+/// n72 fork: record whether this `CAEAGLLayer` renders straight into the
+/// window back buffer.
+pub fn set_layer_window_backed(env: &mut Environment, layer: id, on: bool) {
+    env.objc
+        .borrow_mut::<CALayerHostObject>(layer)
+        .n72_window_backed = on;
+}
+
 /// For use by `EAGLContext` when presenting to a `CAEAGLLayer`:
 /// [std::mem::take]s the buffer used to hold the pixels. It should be passed
 /// back to [present_pixels] once it has been filled.
@@ -178,6 +294,7 @@ pub fn present_texture(
     host_obj.gles_texture_is_up_to_date = false;
 }
 
+#[cfg(feature = "n72-prof")]
 /// n72 fork, debugging aid: log a window's layer tree (class, geometry,
 /// visibility) once, to see whether an app's GL layer is the bottom-most
 /// full-screen content (N72_LAYER_DUMP).

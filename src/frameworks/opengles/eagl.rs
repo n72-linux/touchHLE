@@ -7,7 +7,8 @@
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
-    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, present_pixels,
+    find_fullscreen_eagl_base, find_fullscreen_eagl_layer, get_pixels_vec_for_presenting,
+    present_pixels, set_layer_window_backed,
 };
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -348,6 +349,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // n72 fork: once the renderbuffer is window-backed (n72-gles draws
         // it straight into the panel's back buffer), presenting is a swap.
         if crate::window::Window::fixed_portrait_panel() && n72_is_window_backed(renderbuffer) {
+            set_layer_window_backed(env, drawable, true);
             drop(super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread));
             env.window.as_ref().unwrap().swap_window();
             if let Some(sleep_for) = sleep_for {
@@ -360,17 +362,70 @@ pub const CLASSES: ClassExports = objc_classes! {
             present_renderbuffer(env);
         }
         if crate::window::Window::fixed_portrait_panel() {
-            let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-            unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, true) };
+            {
+                let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, true) };
+            }
+            set_layer_window_backed(env, drawable, n72_is_window_backed(renderbuffer));
         }
     } else {
+        // n72 fork: if this opaque fullscreen CAEAGLLayer only has overlay
+        // layers on top of it (e.g. Spore's menu ticker tab), keep it
+        // window-backed and blend only the visible on-screen overlays onto
+        // the panel back buffer without copying or re-blitting the 3D frame.
+        if fullscreen_layer == nil && crate::window::Window::fixed_portrait_panel() {
+            if let Some((base, overlay_roots)) = find_fullscreen_eagl_base(env) {
+                if base == drawable {
+                    if n72_is_window_backed(renderbuffer) {
+                        set_layer_window_backed(env, drawable, true);
+                        drop(super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread));
+                        if !crate::frameworks::core_animation::composite_eagl_overlays_to_window(
+                            env,
+                            &overlay_roots,
+                        ) {
+                            env.window.as_ref().unwrap().swap_window();
+                        }
+                        if let Some(sleep_for) = sleep_for {
+                            env.sleep(sleep_for);
+                        }
+                        return true;
+                    }
+                    // First frame before the renderbuffer is window-backed:
+                    // composite this frame once from its shared texture, then
+                    // switch the renderbuffer to window-backed for all later
+                    // frames.
+                    let existing = crate::frameworks::core_animation::ca_eagl_layer::presented_texture_for(env, drawable);
+                    let opaque = crate::frameworks::core_animation::ca_eagl_layer::layer_is_opaque(env, drawable);
+                    let (texture, width, height) = {
+                        let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                        unsafe { copy_renderbuffer_to_texture(gles.as_mut(), existing, opaque) }
+                    };
+                    crate::frameworks::core_animation::ca_eagl_layer::present_texture(env, drawable, texture, width, height);
+                    set_layer_window_backed(env, drawable, false);
+                    crate::frameworks::core_animation::recomposite_if_necessary(env, true);
+                    {
+                        let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                        unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, true) };
+                    }
+                    set_layer_window_backed(env, drawable, n72_is_window_backed(renderbuffer));
+                    if let Some(sleep_for) = sleep_for {
+                        env.sleep(sleep_for);
+                    }
+                    return true;
+                }
+            }
+        }
+
         if crate::window::Window::fixed_portrait_panel() && n72_is_window_backed(renderbuffer) {
             // Not the only layer any more: back to the renderbuffer's own
             // storage (this frame is in the panel buffer: copy it out first
             // below, or drop it when this layer is hidden anyway).
             if fullscreen_layer != nil {
-                let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-                unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false) };
+                {
+                    let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
+                    unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false) };
+                }
+                set_layer_window_backed(env, drawable, false);
             }
         }
         if fullscreen_layer != nil {
@@ -414,6 +469,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 }
                 r
             };
+            set_layer_window_backed(env, drawable, false);
             crate::frameworks::core_animation::ca_eagl_layer::present_texture(env, drawable, texture, width, height);
             if let Some(sleep_for) = sleep_for {
                 env.sleep(sleep_for);
