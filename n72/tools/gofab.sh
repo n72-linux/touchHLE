@@ -14,6 +14,7 @@
 #   flight  + Survival Mode, Start x2; window 100-130 s, survival flight with enemies
 #   spore   Spore Origins into play (two taps); window 70-100 s. Its save folder is copied
 #           before the runs and put back after them.
+#   spore-menu  Spore Origins left on its main menu (no taps); window 40-70 s. Save as spore.
 # Every run: N72_FIXED_SEED=1, n72-ui stopped, panel on, backlight 0 (restored at the end).
 # PROF=1: also the N72_PROF sampler over the window (prof.bin + maps.txt, for prof-report.py);
 # the sampler rides on the existing time-slice tick, but keep timing runs and profile runs apart.
@@ -35,7 +36,8 @@ menu-long) TAPS="20:156,240"; W0=30; W1=150 ;;	# the menu for 2 minutes (routing
 modes)  TAPS="20:156,240 45:118,240"; W0=50; W1=57 ;;
 flight) TAPS="20:156,240 45:118,240 58:194,240 72:305,72 84:305,72"; W0=100; W1=130 ;;
 spore)  APP=touchHLE_apps/Spore.app; TAPS="32:300,25 38:128,238"; W0=70; W1=100 ;;	# into play (runx.sh's taps)
-*) echo "route: menu, menu-long, modes, flight or spore"; exit 2 ;;
+spore-menu) APP=touchHLE_apps/Spore.app; TAPS=""; W0=40; W1=70 ;;
+*) echo "route: menu, menu-long, modes, flight, spore or spore-menu"; exit 2 ;;
 esac
 OUT=${OUT:-/root/gof/ab/$(date +%Y%m%d-%H%M)-$R}
 mkdir -p $OUT/runs || exit 1
@@ -96,7 +98,7 @@ done < $V
 cat $OUT/info.txt
 [ -f $OUT/results.tsv ] || echo "route	round	name	fps_med	fps_min	fps_max	seconds	main_ms_frame	other_ms_frame	scenes_frame	ta_ms_frame	render_ms_frame" > $OUT/results.tsv
 
-if [ $R = spore ]; then	# the game saves as it is played: the user's save back afterwards
+if [ $APP = touchHLE_apps/Spore.app ]; then	# the game saves as it is played: the user's save back afterwards
 	SB=$H/touchHLE_sandbox/com.ea.spore.naj.efigsj
 	rm -rf $OUT/spore-save; cp -a $SB $OUT/spore-save || exit 1
 fi
@@ -121,7 +123,7 @@ while [ $r -le $N ]; do
 		pe=; [ -n "$PROF" ] && pe="N72_PROF=$d/prof.bin N72_PROF_SKIP=$W0"
 		le=; [ "$lib" = - ] || le="LD_LIBRARY_PATH=$lib"
 		cd $H
-		env $env $le $pe N72_FIXED_SEED=1 N72_GLES_VGP=1 SDL_VIDEODRIVER=kmsdrm RUST_BACKTRACE=1 \
+		env $env $le $pe N72_FIXED_SEED=1 SDL_VIDEODRIVER=kmsdrm RUST_BACKTRACE=1 \
 			$bin $APP --print-fps > $d/log 2>&1 &
 		p=$!
 		now=0
