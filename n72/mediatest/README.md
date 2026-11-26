@@ -38,7 +38,7 @@ red after a step failed (file not in the bundle, unknown action).
 
     sh build.sh OUT_DIR
 
-This needs the Docker image `ios-armv6-tc` (see `ios-tc/README.md`). There
+This needs the Docker image `ios-armv6-tc` (built from `../n72-alpine/docker/Dockerfile.ios-armv6`). There
 is no iOS SDK: `decls.h` declares the few classes and functions used, and
 `stubs/*.tbd` export exactly the symbols the binary imports. If you use a
 new class, function or constant, add it to both and check that touchHLE

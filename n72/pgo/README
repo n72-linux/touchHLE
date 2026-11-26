@@ -4,7 +4,8 @@ Profile-guided and link-time optimised builds of the n72 binary
 build.sh VARIANT builds touchHLE for the iPod touch 2G one of several ways,
 each in its own target directory, target/n72-var/VARIANT:
 
-  base    -O3, no LTO, no profile (how n72/env.sh's command builds it)
+  base    -O3, no LTO, no profile (n72/env.sh defaults to -O2 + fat LTO + cgu=1)
+  o2      -O2, no LTO, no profile
   gen     instrumented for a profile: the Rust code and OpenAL Soft, -O2
   o3pgo   -O3 with touchHLE.profdata
   o2lto   -O2, LTO, profile
@@ -23,7 +24,7 @@ rustc 1.99 and Homebrew's clang are LLVM 23 and write raw profile format 11;
 Alpine 3.24's compiler-rt (LLVM 22) has format 10, and rustup ships no
 profiler_builtins for arm-unknown-linux-musleabihf. So the runtime is built
 from compiler-rt's lib/profile of LLVM 23.1.1:
-build/alpine/src/compiler-rt-23/build.sh -> libclang_rt.profile-armhf.a.
+build/alpine/src/compiler-rt-23/build/libclang_rt.profile-armhf.a.
 build.sh gen links it into the Rust side (-Z no-profiler-runtime under
 RUSTC_BOOTSTRAP, which is why the gen build needs it) and gives clang a
 copy of its resource directory with the runtime in it, so that CMake's
@@ -81,8 +82,8 @@ altest's wall time on the device was not measured (busybox date has no %N).
 
 `build.sh o2` (plain -O2, no LTO, no profile) against `build.sh base`
 (-O3). altest: identical checksums under qemu and on the device, 1.78-1.81 s
-for both. Spore (runx.sh, 60 s of play, N72_FIXED_SEED, ALSOFT_DRIVERS=null,
-the save restored before every run), main thread ms/frame:
+for both. Spore (60 s of play, N72_FIXED_SEED, ALSOFT_DRIVERS=null,
+the save restored before every run via `touchHLE/n72/tools/`), main thread ms/frame:
 
   run                     base (-O3)    o2
   n72-ui kept running     19.8-21.0     30.0-35.3
@@ -92,6 +93,8 @@ the save restored before every run), main thread ms/frame:
 The main thread sits at about 20 or about 31 ms a frame from run to run,
 with either build: a state of the run, not the build (cause unknown). The
 mixer thread 3.8-6 ms on both, the game at 20 FPS throughout. -O3 shows no
-gain, so n72/env.sh builds at -O2 since (CARGO_PROFILE_RELEASE_OPT_LEVEL=2).
-runx.sh with KEEPUI=1 lets n72-ui's idle timer sleep the iPod mid-run (the
-game was not started by n72-ui, so it does not count as played): use 0.
+gain, so `n72/env.sh` defaults to `-O2` with fat LTO and single codegen unit
+(`CARGO_PROFILE_RELEASE_OPT_LEVEL=2`, `CARGO_PROFILE_RELEASE_LTO=fat`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`, clang `-flto`, `-Wl,--lto-O2`). Note
+that enabling `n72-ui`'s idle timer can sleep the iPod mid-run when touchHLE
+is launched outside `n72-ui` (`KEEPUI=1` benchmark harnesses).
