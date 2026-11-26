@@ -1,10 +1,10 @@
 #!/bin/sh
-# ab-build.sh lib COMMIT [gcc|clang]   n72-gles at COMMIT -> ~/n72-linux/ab-kits/builds/lib-<commit>[-clang]/
-# ab-build.sh hle COMMIT [gcc|clang]   touchHLE at COMMIT  -> ~/n72-linux/ab-kits/builds/hle-<commit>[-clang]/touchHLE
+# ab-build.sh lib COMMIT [gcc|clang]   n72-gles at COMMIT -> "$PWD"/ab-kits/builds/lib-<commit>[-clang]/
+# ab-build.sh hle COMMIT [gcc|clang]   touchHLE at COMMIT  -> "$PWD"/ab-kits/builds/hle-<commit>[-clang]/touchHLE
 # On the Mac, from the commit alone (git archive / a private copy of the touchHLE tree), so the
 # checkouts other sessions work in are never touched. The outputs keep their symbols (the
 # kits strip what goes to the device); a build that exists is not made again.
-# touchHLE is built in ~/n72-linux/touchHLE-ab (an rsync copy of touchHLE without target/,
+# touchHLE is built in "$PWD"/touchHLE-ab (an rsync copy of touchHLE without target/,
 # checked out at COMMIT; its target/ is kept between builds). Its submodules come along as they
 # are in the touchHLE checkout: a COMMIT that needs other submodule commits is refused.
 set -e

@@ -16,7 +16,7 @@ H=$(cd "$(dirname "$0")/../.." && pwd)
 case $V in base|o2) N72_CC=${N72_CC:-clang} ;; *) N72_CC=clang ;; esac
 export N72_CC
 . "$H/n72/env.sh"
-RT=$H/../alpine-work/src/compiler-rt-23/build/libclang_rt.profile-armhf.a
+RT=$H/../build/alpine/src/compiler-rt-23/build/libclang_rt.profile-armhf.a
 PROF=$H/n72/pgo/touchHLE.profdata
 T=arm-unknown-linux-musleabihf
 R=$CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS

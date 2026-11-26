@@ -6,7 +6,7 @@
 #   LIB  installed (/usr/lib), or a Mac directory or libn72gles.so.1 (an ab-build.sh output)
 # Example:
 #   ab-kit.sh routing base=installed,installed new=installed,ab-kits/builds/lib-d6850c8
-# Writes ~/n72-linux/ab-kits/KIT/ (variants.txt for the device, sources.txt with the Mac
+# Writes "$PWD"/ab-kits/KIT/ (variants.txt for the device, sources.txt with the Mac
 # files that keep the symbols, stripped copies) and ab-kits/KIT.tar.gz (root-owned, made by
 # roottar.py). On the iPod: tar xzf KIT.tar.gz -C /root  ->  /root/ab/KIT, then
 #   sh /root/ab/KIT/gofab.sh menu 3 /root/ab/KIT/variants.txt

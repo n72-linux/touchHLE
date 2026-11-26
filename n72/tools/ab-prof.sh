@@ -20,7 +20,7 @@ mh=${HLE:-$1}; ml=${LIB:-$2}
 ${CROSS}nm -n -C --defined-only "$mh" | grep -i ' [tw] ' > $d/hle.syms
 ${CROSS}nm -n --defined-only "$ml" | grep -i ' [tw] ' > $d/gles.syms
 m=$d/../../ld-musl-armhf.so.1	# the device's, saved by gofab.sh PROF=1
-[ -f $m ] || m=$W/alpine-work/sysroot-armhf/lib/ld-musl-armhf.so.1
+[ -f $m ] || m=$W/build/alpine/sysroot-armhf/lib/ld-musl-armhf.so.1
 ${CROSS}nm -n -D --defined-only $m | grep -i ' [tw] ' > $d/musl.syms
 echo "musl on the Mac: $(md5 -q $m | cut -c1-8); on the device: $(grep -h '^musl' $d/../../info.txt 2>/dev/null)"
 cp $W/ab-kits/syms/gof.syms $d/

@@ -1,5 +1,5 @@
 #!/bin/sh
-# ab-fetch.sh [DEVICE_DIR...]: copy gofab.sh results from the iPod to ~/n72-linux/ab-results/.
+# ab-fetch.sh [DEVICE_DIR...]: copy gofab.sh results from the iPod to "$PWD"/ab-results/.
 # Default: every directory under /root/gof/ab not fetched yet. Prints the report of each.
 # N72_HOST: the iPod's address (default 192.168.7.2, USB). Profiles of a run:
 #   ab-prof.sh ab-results/<dir>/runs/<run> KIT NAME

@@ -11,7 +11,7 @@
 #   gcc            the cross gcc of ../n72-alpine/toolchain (GNU ld; its own
 #                  libstdc++ linked statically)
 N72_HLE=$(cd "$(dirname "${BASH_SOURCE:-${(%):-%x}}")/.." && pwd)
-N72_SYSROOT=${N72_SYSROOT:-$N72_HLE/../alpine-work/sysroot-armhf}
+N72_SYSROOT=${N72_SYSROOT:-$N72_HLE/../build/alpine/sysroot-armhf}
 export N72_SYSROOT
 if [ "${N72_CC:-clang}" = gcc ]; then
 	N72_ENV=$N72_HLE/../n72-alpine/toolchain/env.sh

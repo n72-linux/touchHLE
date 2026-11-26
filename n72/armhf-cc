@@ -1,9 +1,9 @@
 #!/bin/sh
 # clang for the iPod touch 2G (ARM1176: ARMv6, VFPv2, hard float, musl),
-# against the Alpine armhf sysroot exported to alpine-work/sysroot-armhf.
+# against the Alpine armhf sysroot exported to build/alpine/sysroot-armhf.
 # Links with lld (rust-lld through rustup's gcc-ld/ld.lld wrapper).
 H=$(cd "$(dirname "$0")" && pwd)
-SYSROOT=${N72_SYSROOT:-$H/../../alpine-work/sysroot-armhf}
+SYSROOT=${N72_SYSROOT:-$H/../../build/alpine/sysroot-armhf}
 RUSTLIB=${N72_RUSTLIB:-$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin}
 CLANG=${N72_CLANG:-/opt/homebrew/opt/llvm/bin/clang}
 case "$(basename "$0")" in *++) CLANG=$CLANG++ ;; esac

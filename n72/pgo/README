@@ -23,7 +23,7 @@ rustc 1.99 and Homebrew's clang are LLVM 23 and write raw profile format 11;
 Alpine 3.24's compiler-rt (LLVM 22) has format 10, and rustup ships no
 profiler_builtins for arm-unknown-linux-musleabihf. So the runtime is built
 from compiler-rt's lib/profile of LLVM 23.1.1:
-alpine-work/src/compiler-rt-23/build.sh -> libclang_rt.profile-armhf.a.
+build/alpine/src/compiler-rt-23/build.sh -> libclang_rt.profile-armhf.a.
 build.sh gen links it into the Rust side (-Z no-profiler-runtime under
 RUSTC_BOOTSTRAP, which is why the gen build needs it) and gives clang a
 copy of its resource directory with the runtime in it, so that CMake's
