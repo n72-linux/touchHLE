@@ -453,6 +453,13 @@ pub fn run_run_loop(
         // events that are scheduled but we can't get the time for currently
         // (audio queue buffer exhaustion).
         //
+        // Account for timers added during this iteration's callbacks (e.g. a
+        // one-shot timer scheduling the next frame's timer inside its callback):
+        // `timers_tmp` only covered timers present at iteration start.
+        for &timer in &env.objc.borrow::<NSRunLoopHostObject>(run_loop).timers {
+            limit_sleep_time(&mut sleep_until, ns_timer::next_due_by(env, timer));
+        }
+
         // The compromise used here is that we will wait for a 60th of a second,
         // or until the next scheduled event, whichever is sooner. iPhone OS
         // apps can't do more than 60fps so this should be fine.

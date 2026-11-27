@@ -173,6 +173,17 @@ pub(super) fn set_run_loop(env: &mut Environment, timer: id, run_loop: id) {
     host_object.run_loop = run_loop;
 }
 
+/// For use by `NSRunLoop`: return when a timer is next due, if valid and not
+/// currently executing its callback.
+pub(super) fn next_due_by(env: &Environment, timer: id) -> Option<Instant> {
+    let host_object = env.objc.borrow::<NSTimerHostObject>(timer);
+    if host_object.is_running_callback {
+        None
+    } else {
+        host_object.due_by
+    }
+}
+
 /// For use by `NSRunLoop`: check if a timer is due to fire and fire it if
 /// necessary.
 ///

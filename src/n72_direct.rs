@@ -109,6 +109,13 @@ const DIRECT_GL: &[&str] = &[
     "glPolygonOffsetx",
     "glDepthRangex",
     "glHint",
+    "glLightModelx",
+    "glLightModelxv",
+    "glLightModelfv",
+    "glTexEnvfv",
+    "glTexEnvxv",
+    "glTexEnviv",
+    "glPixelStorei",
 ];
 
 /// Direct GL functions that assume `scale_hack == 1` (resolved only then).
@@ -393,6 +400,128 @@ extern "aapcs" fn n72_strstr(haystack: *const libc::c_char, needle: *const libc:
     unsafe { libc::strstr(haystack, needle) }
 }
 
+// Direct wide-char string/memory calls (`wchar_t` = `i32` on Darwin ARM,
+// matching `src/libc/wchar.rs`). Implemented directly rather than calling
+// musl's `wcs*` so behavior matches `GenericChar<i32>` and null pointers
+// with `n == 0` are safe.
+extern "aapcs" fn n72_wcslen(s: *const i32) -> usize {
+    let mut i = 0;
+    unsafe {
+        while s.add(i).read_unaligned() != 0 {
+            i += 1;
+        }
+    }
+    i
+}
+extern "aapcs" fn n72_wcscmp(a: *const i32, b: *const i32) -> i32 {
+    let mut i = 0;
+    unsafe {
+        loop {
+            let ca = a.add(i).read_unaligned();
+            let cb = b.add(i).read_unaligned();
+            if ca != cb {
+                return if ca < cb { -1 } else { 1 };
+            }
+            if ca == 0 {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+}
+extern "aapcs" fn n72_wcsncmp(a: *const i32, b: *const i32, n: usize) -> i32 {
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            let ca = a.add(i).read_unaligned();
+            let cb = b.add(i).read_unaligned();
+            if ca != cb {
+                return if ca < cb { -1 } else { 1 };
+            }
+            if ca == 0 {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+    0
+}
+extern "aapcs" fn n72_wcscpy(dst: *mut i32, src: *const i32) -> *mut i32 {
+    let mut i = 0;
+    unsafe {
+        loop {
+            let c = src.add(i).read_unaligned();
+            dst.add(i).write_unaligned(c);
+            if c == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+    dst
+}
+extern "aapcs" fn n72_wcsncpy(dst: *mut i32, src: *const i32, n: usize) -> *mut i32 {
+    let mut i = 0;
+    let mut ended = false;
+    unsafe {
+        while i < n {
+            if !ended {
+                let c = src.add(i).read_unaligned();
+                if c == 0 {
+                    ended = true;
+                }
+                dst.add(i).write_unaligned(c);
+            } else {
+                dst.add(i).write_unaligned(0);
+            }
+            i += 1;
+        }
+    }
+    dst
+}
+extern "aapcs" fn n72_wmemmove(dst: *mut i32, src: *const i32, n: usize) -> *mut i32 {
+    if n != 0 {
+        unsafe { libc::memmove(dst.cast(), src.cast(), n * std::mem::size_of::<i32>()) };
+    }
+    dst
+}
+extern "aapcs" fn n72_wmemset(dst: *mut i32, c: i32, n: usize) -> *mut i32 {
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            dst.add(i).write_unaligned(c);
+            i += 1;
+        }
+    }
+    dst
+}
+extern "aapcs" fn n72_wmemcmp(a: *const i32, b: *const i32, n: usize) -> i32 {
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            let ca = a.add(i).read_unaligned();
+            let cb = b.add(i).read_unaligned();
+            if ca != cb {
+                return if ca < cb { -1 } else { 1 };
+            }
+            i += 1;
+        }
+    }
+    0
+}
+extern "aapcs" fn n72_wmemchr(s: *const i32, c: i32, n: usize) -> *const i32 {
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            if s.add(i).read_unaligned() == c {
+                return s.add(i);
+            }
+            i += 1;
+        }
+    }
+    std::ptr::null()
+}
+
 /// The host function (guest calling convention) for an import, and whether
 /// it needs the GL context ready.
 fn target(symbol: &str) -> Option<(usize, bool)> {
@@ -448,6 +577,15 @@ fn target(symbol: &str) -> Option<(usize, bool)> {
         "strchr" => return Some((n72_strchr as *const () as usize, false)),
         "strrchr" => return Some((n72_strrchr as *const () as usize, false)),
         "strstr" => return Some((n72_strstr as *const () as usize, false)),
+        "wcslen" => return Some((n72_wcslen as *const () as usize, false)),
+        "wcscmp" => return Some((n72_wcscmp as *const () as usize, false)),
+        "wcsncmp" => return Some((n72_wcsncmp as *const () as usize, false)),
+        "wcscpy" => return Some((n72_wcscpy as *const () as usize, false)),
+        "wcsncpy" => return Some((n72_wcsncpy as *const () as usize, false)),
+        "wmemcpy" | "wmemmove" => return Some((n72_wmemmove as *const () as usize, false)),
+        "wmemset" => return Some((n72_wmemset as *const () as usize, false)),
+        "wmemcmp" => return Some((n72_wmemcmp as *const () as usize, false)),
+        "wmemchr" => return Some((n72_wmemchr as *const () as usize, false)),
         _ => (),
     }
     if DIRECT_GL.contains(&name) || DIRECT_GL_UNSCALED.contains(&name) {
