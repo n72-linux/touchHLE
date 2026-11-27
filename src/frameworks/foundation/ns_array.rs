@@ -692,6 +692,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, object);
 }
 
+- (())exchangeObjectAtIndex:(NSUInteger)idx1 withObjectAtIndex:(NSUInteger)idx2 {
+    env.objc
+        .borrow_mut::<ArrayHostObject>(this)
+        .array
+        .swap(idx1 as usize, idx2 as usize);
+}
+
+- (())removeObjectsInRange:(NSRange)range {
+    let start = range.location as usize;
+    let end = start + range.length as usize;
+    let removed: Vec<id> = env
+        .objc
+        .borrow_mut::<ArrayHostObject>(this)
+        .array
+        .drain(start..end)
+        .collect();
+    for object in removed {
+        release(env, object);
+    }
+}
+
 - (())removeLastObject {
     let object = env.objc.borrow_mut::<ArrayHostObject>(this).array.pop().unwrap();
     release(env, object)

@@ -71,6 +71,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)copyWithZone:(NSZonePtr)_zone {
     retain(env, this)
 }
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    let new: id = msg_class![env; NSMutableSet alloc];
+    msg![env; new initWithSet:this]
+}
 
 - (bool)containsObject:(id)object {
     let enumerator: id = msg![env; this objectEnumerator];
@@ -117,7 +121,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
-    todo!(); // TODO: this should produce an immutable copy
+    let new: id = msg_class![env; NSSet alloc];
+    msg![env; new initWithSet:this]
 }
 
 @end
@@ -151,6 +156,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithArray:(id)array {
     env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_array(env, array);
+    this
+}
+
+- (id)initWithSet:(id)other {
+    env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_set(env, other);
     this
 }
 
@@ -232,6 +242,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithArray:(id)array {
     env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_array(env, array);
+    this
+}
+
+- (id)initWithSet:(id)other {
+    env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_set(env, other);
     this
 }
 
@@ -355,6 +370,22 @@ fn set_from_array(env: &mut Environment, array: id) -> DictionaryHostObject {
     for i in 0..count {
         let next: id = msg![env; array objectAtIndex:i];
         dict.insert(env, next, null, /* copy_key: */ false);
+    }
+    dict
+}
+
+/// Helper method shared between `initWithSet:` of `_touchHLE_NSSet` and
+/// `_touchHLE_NSMutableSet`
+fn set_from_set(env: &mut Environment, other: id) -> DictionaryHostObject {
+    if other == nil {
+        return Default::default();
+    }
+    let keys: Vec<id> = env.objc.borrow::<SetHostObject>(other).dict.iter_keys().collect();
+    let null: id = msg_class![env; NSNull null];
+
+    let mut dict = <DictionaryHostObject as Default>::default();
+    for key in keys {
+        dict.insert(env, key, null, /* copy_key: */ false);
     }
     dict
 }

@@ -5,7 +5,8 @@
  */
 //! `NSData` and `NSMutableData`.
 
-use super::ns_string::to_rust_string;
+use super::ns_error::{NSCocoaErrorDomain, NSFileReadNoSuchFileError};
+use super::ns_string::{get_static_str, to_rust_string};
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::fs::GuestPath;
@@ -72,6 +73,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
++ (id)dataWithContentsOfFile:(id)path
+                     options:(NSUInteger)read_options_mask
+                       error:(MutPtr<id>)error { // NSError**
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithContentsOfFile:path options:read_options_mask error:error];
+    autorelease(env, new)
+}
+
 + (id)dataWithContentsOfMappedFile:(id)path {
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithContentsOfMappedFile:path];
@@ -81,6 +90,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)dataWithContentsOfURL:(id)url {
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithContentsOfURL:url];
+    autorelease(env, new)
+}
+
++ (id)dataWithContentsOfURL:(id)url
+                    options:(NSUInteger)read_options_mask
+                      error:(MutPtr<id>)error { // NSError**
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithContentsOfURL:url options:read_options_mask error:error];
     autorelease(env, new)
 }
 
@@ -127,6 +144,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfURL:(id)url { // NSURL *
+    if url == nil {
+        release(env, this);
+        return nil;
+    }
     if msg![env; url isFileURL] {
         let ns_path: id = msg![env; url path];
         let path = to_rust_string(env, ns_path);
@@ -142,8 +163,30 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (id)initWithContentsOfURL:(id)url // NSURL *
+                    options:(NSUInteger)read_options_mask
+                      error:(MutPtr<id>)error { // NSError**
+    log_dbg!(
+        "[(NSData*){:?} initWithContentsOfURL:{:?} options:{:#x} error:{:?}]",
+        this,
+        url,
+        read_options_mask,
+        error
+    );
+    let res: id = msg![env; this initWithContentsOfURL:url];
+    if res == nil && !error.is_null() {
+        let domain = get_static_str(env, NSCocoaErrorDomain);
+        let err = msg_class![env; NSError alloc];
+        let err = msg![env; err initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
+        autorelease(env, err);
+        env.mem.write(error, err);
+    }
+    res
+}
+
 - (id)initWithContentsOfFile:(id)path {
     if path == nil {
+        release(env, this);
         return nil;
     }
     let path = to_rust_string(env, path);
@@ -161,6 +204,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     host_object.bytes = alloc;
     host_object.length = size;
     this
+}
+
+- (id)initWithContentsOfFile:(id)path
+                     options:(NSUInteger)read_options_mask
+                       error:(MutPtr<id>)error { // NSError**
+    log_dbg!(
+        "[(NSData*){:?} initWithContentsOfFile:{:?} options:{:#x} error:{:?}]",
+        this,
+        path,
+        read_options_mask,
+        error
+    );
+    let res: id = msg![env; this initWithContentsOfFile:path];
+    if res == nil && !error.is_null() {
+        let domain = get_static_str(env, NSCocoaErrorDomain);
+        let err = msg_class![env; NSError alloc];
+        let err = msg![env; err initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
+        autorelease(env, err);
+        env.mem.write(error, err);
+    }
+    res
 }
 
 - (id)initWithContentsOfMappedFile:(id)path {

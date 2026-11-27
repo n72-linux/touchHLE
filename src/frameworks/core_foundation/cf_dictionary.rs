@@ -20,7 +20,7 @@ use crate::frameworks::foundation::ns_dictionary::{
     CFDictionaryKeyCallBacks, CFDictionaryValueCallBacks,
 };
 use crate::frameworks::foundation::NSUInteger;
-use crate::mem::{ConstPtr, ConstVoidPtr, Mem, MutVoidPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, Mem, MutPtr, MutVoidPtr};
 use crate::objc::{id, msg, msg_class, nil};
 use crate::Environment;
 
@@ -102,6 +102,24 @@ fn CFDictionaryGetValue(
     let key: id = key.cast().cast_mut();
     let res: id = msg![env; dict objectForKey:key];
     res.cast().cast_const()
+}
+
+fn CFDictionaryGetValueIfPresent(
+    env: &mut Environment,
+    dict: CFDictionaryRef,
+    key: ConstVoidPtr,
+    value: MutPtr<ConstVoidPtr>,
+) -> bool {
+    let key: id = key.cast().cast_mut();
+    let res: id = msg![env; dict objectForKey:key];
+    if res != nil {
+        if !value.is_null() {
+            env.mem.write(value, res.cast().cast_const());
+        }
+        true
+    } else {
+        false
+    }
 }
 
 fn CFDictionaryGetCount(env: &mut Environment, dict: CFDictionaryRef) -> CFIndex {
@@ -263,6 +281,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFDictionaryRemoveValue(_, _)),
     export_c_func!(CFDictionaryRemoveAllValues(_)),
     export_c_func!(CFDictionaryGetValue(_, _)),
+    export_c_func!(CFDictionaryGetValueIfPresent(_, _, _)),
     export_c_func!(CFDictionaryGetCount(_)),
     export_c_func!(CFDictionaryGetKeysAndValues(_, _, _)),
 ];

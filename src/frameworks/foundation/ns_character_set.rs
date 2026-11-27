@@ -130,6 +130,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
++ (id)decimalDigitCharacterSet {
+    let set = ('0'..='9').map(|c| unichar::try_from(c).unwrap()).collect();
+
+    let new: id = msg![env; this alloc];
+    env.objc.borrow_mut::<CharacterSetHostObject>(new).set = set;
+
+    autorelease(env, new)
+}
+
++ (id)alphanumericCharacterSet {
+    let set = ('0'..='9')
+        .chain('A'..='Z')
+        .chain('a'..='z')
+        .map(|c| unichar::try_from(c).unwrap())
+        .collect();
+
+    let new: id = msg![env; this alloc];
+    env.objc.borrow_mut::<CharacterSetHostObject>(new).set = set;
+
+    autorelease(env, new)
+}
+
 @end
 
 // NSMutableCharacterSet defines no primitive methods. Subclasses must
