@@ -37,8 +37,8 @@ pub(super) struct State {
 }
 
 struct MiscGlObjects {
-    /// Texture containing a single rounded corner.
-    rounded_corner_texture: GLuint,
+    /// Texture containing a single rounded corner, created lazily on first use.
+    rounded_corner_texture: std::cell::Cell<Option<GLuint>>,
     /// [BASIC_SQUARE_POINTS], used as both vertex and texture co-ords for
     /// drawing simple textured quads.
     basic_square_buffer: GLuint,
@@ -702,45 +702,6 @@ fn ensure_misc_gl_objects<'a>(
     gles: &mut dyn GLES,
 ) -> &'a MiscGlObjects {
     slot.get_or_insert_with(|| {
-        let dimension = 512usize; // way larger than any reasonable corner
-        let mut image = Image::from_pixel_vec(
-            vec![255u8; dimension * dimension * 4],
-            (dimension as _, dimension as _),
-        );
-        image.round_corners(
-            dimension as _,
-            /* four_corners: */ false,
-            /* add_sheen: */ false,
-        );
-
-        let mut rounded_corner_texture = 0;
-        unsafe {
-            gles.GenTextures(1, &mut rounded_corner_texture);
-            gles.BindTexture(gles11::TEXTURE_2D, rounded_corner_texture);
-            // GENERATE_MIPMAP must be set before the texture upload.
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::GENERATE_MIPMAP,
-                gles11::TRUE as _,
-            );
-            upload_rgba8_pixels(gles, image.pixels(), (dimension as _, dimension as _));
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_MIN_FILTER,
-                gles11::LINEAR_MIPMAP_LINEAR as _,
-            );
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_S,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_T,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-        }
-
         let [basic_square_buffer, flipped_square_buffer, rounded_vertex_buffer, rounded_tex_coord_buffer, index_buffer] =
             unsafe {
                 let mut array_buffers = [0; 5];
@@ -786,7 +747,7 @@ fn ensure_misc_gl_objects<'a>(
         }
 
         MiscGlObjects {
-            rounded_corner_texture,
+            rounded_corner_texture: std::cell::Cell::new(None),
             basic_square_buffer,
             flipped_square_buffer,
             rounded_vertex_buffer,
@@ -794,6 +755,53 @@ fn ensure_misc_gl_objects<'a>(
             index_buffer,
         }
     })
+}
+
+unsafe fn ensure_rounded_corner_texture(
+    slot: &std::cell::Cell<Option<GLuint>>,
+    gles: &mut dyn GLES,
+) -> GLuint {
+    if let Some(tex) = slot.get() {
+        return tex;
+    }
+    let dimension = 512usize; // way larger than any reasonable corner
+    let mut image = Image::from_pixel_vec(
+        vec![255u8; dimension * dimension * 4],
+        (dimension as _, dimension as _),
+    );
+    image.round_corners(
+        dimension as _,
+        /* four_corners: */ false,
+        /* add_sheen: */ false,
+    );
+
+    let mut rounded_corner_texture = 0;
+    gles.GenTextures(1, &mut rounded_corner_texture);
+    gles.BindTexture(gles11::TEXTURE_2D, rounded_corner_texture);
+    // GENERATE_MIPMAP must be set before the texture upload.
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::GENERATE_MIPMAP,
+        gles11::TRUE as _,
+    );
+    upload_rgba8_pixels(gles, image.pixels(), (dimension as _, dimension as _));
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_MIN_FILTER,
+        gles11::LINEAR_MIPMAP_LINEAR as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_S,
+        gles11::CLAMP_TO_EDGE as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_T,
+        gles11::CLAMP_TO_EDGE as _,
+    );
+    slot.set(Some(rounded_corner_texture));
+    rounded_corner_texture
 }
 
 fn quad_intersects_screen(quad_matrix: &Matrix<4>, screen_bounds: CGRect) -> bool {
@@ -953,7 +961,8 @@ unsafe fn draw_layer_content(
             );
         } else {
             gles.Enable(gles11::TEXTURE_2D);
-            gles.BindTexture(gles11::TEXTURE_2D, misc.rounded_corner_texture);
+            let rounded_tex = ensure_rounded_corner_texture(&misc.rounded_corner_texture, gles);
+            gles.BindTexture(gles11::TEXTURE_2D, rounded_tex);
             gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
             gles.BindBuffer(gles11::ARRAY_BUFFER, misc.rounded_tex_coord_buffer);
             gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);

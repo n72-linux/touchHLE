@@ -162,6 +162,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         contents,
         superlayer,
         cg_context,
+        gles_texture,
+        presented_texture,
         ref mut sublayers,
         ..
     } = env.objc.borrow_mut(this);
@@ -177,6 +179,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     if let Some(cg_context) = cg_context {
         CGContextRelease(env, cg_context);
+    }
+
+    let delete_presented = presented_texture.is_some() && crate::window::Window::fixed_portrait_panel();
+    if env.window.is_some() && (gles_texture.is_some() || delete_presented) {
+        let mut gles = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        unsafe {
+            if let Some(tex) = gles_texture {
+                if gles.IsTexture(tex) != 0 {
+                    gles.DeleteTextures(1, &tex);
+                }
+            }
+            if delete_presented {
+                if let Some((tex, _, _)) = presented_texture {
+                    if gles.IsTexture(tex) != 0 {
+                        gles.DeleteTextures(1, &tex);
+                    }
+                }
+            }
+        }
+        std::mem::drop(gles);
     }
 
     assert!(superlayer == nil);

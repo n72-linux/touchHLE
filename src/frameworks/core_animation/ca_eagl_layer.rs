@@ -6,6 +6,7 @@
 //! `CAEAGLLayer`.
 
 use super::ca_layer::CALayerHostObject;
+use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::objc::{id, msg, msg_class, nil, objc_classes, Class, ClassExports};
 use crate::Environment;
@@ -32,6 +33,133 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FullscreenEaglRotation {
+    Identity,
+    /// +90° clockwise in UIKit Y-down space (UIInterfaceOrientationLandscapeRight)
+    Rotate90Cw,
+    /// 180° (UIInterfaceOrientationPortraitUpsideDown)
+    Rotate180,
+    /// -90° counter-clockwise in UIKit Y-down space (UIInterfaceOrientationLandscapeLeft)
+    Rotate90Ccw,
+}
+
+fn classify_quarter_turn(t: CGAffineTransform) -> Option<FullscreenEaglRotation> {
+    const EPS: f32 = 1e-4;
+    if t.tx.abs() >= EPS || t.ty.abs() >= EPS {
+        return None;
+    }
+    if (t.a - 1.0).abs() < EPS && t.b.abs() < EPS && t.c.abs() < EPS && (t.d - 1.0).abs() < EPS {
+        Some(FullscreenEaglRotation::Identity)
+    } else if t.a.abs() < EPS && (t.b - 1.0).abs() < EPS && (t.c + 1.0).abs() < EPS && t.d.abs() < EPS {
+        Some(FullscreenEaglRotation::Rotate90Cw)
+    } else if (t.a + 1.0).abs() < EPS && t.b.abs() < EPS && t.c.abs() < EPS && (t.d + 1.0).abs() < EPS {
+        Some(FullscreenEaglRotation::Rotate180)
+    } else if t.a.abs() < EPS && (t.b + 1.0).abs() < EPS && (t.c - 1.0).abs() < EPS && t.d.abs() < EPS {
+        Some(FullscreenEaglRotation::Rotate90Ccw)
+    } else {
+        None
+    }
+}
+
+/// If there is an opaque `CAEAGLLayer` that covers the entire screen
+/// (including quarter-turn rotated fullscreen layers),
+/// returns `(layer, rotation)`. Otherwise returns `None`.
+pub fn find_fullscreen_eagl_layer_with_rotation(
+    env: &mut Environment,
+) -> Option<(id, FullscreenEaglRotation)> {
+    if env.options.force_composition {
+        return None;
+    }
+
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    // Assumes the windows in the list are ordered back-to-front.
+    // TODO: this may not be correct once we support windowLevel.
+    let top_window = windows
+        .into_iter()
+        .rev()
+        .find(|&window| !msg![env; window isHidden])?;
+
+    let screen_bounds: CGRect = {
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        msg![env; screen bounds]
+    };
+
+    let mut layer: id = msg![env; top_window layer];
+
+    // Descend through the hierarchy, looking only at the last layer in each
+    // list of children, since that should be the one on top.
+    // TODO: this is not correct once we support zPosition.
+    let rotation = loop {
+        assert!(layer != nil);
+
+        let layer_host_obj: &CALayerHostObject = env.objc.borrow(layer);
+
+        // n72 fork: hidden or fully transparent sublayers draw nothing, so
+        // they must not stop the descent (Spore's GL layer carries a hidden
+        // news ticker as its last sublayer, which forced composition every
+        // frame).
+        let visible_last = layer_host_obj.sublayers.iter().rev().copied().find(|&sub| {
+            let h = env.objc.borrow::<CALayerHostObject>(sub);
+            !h.hidden && h.opacity > 0.0
+        });
+
+        if let Some(next) = visible_last {
+            // Intermediate ancestor layer: keep the existing strict identity check.
+            if layer_host_obj.bounds.size != screen_bounds.size
+                || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
+                || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
+                || layer_host_obj.position
+                    != (CGPoint {
+                        x: screen_bounds.size.width / 2.0,
+                        y: screen_bounds.size.height / 2.0,
+                    })
+                || layer_host_obj.hidden
+                || layer_host_obj.opacity != 1.0
+                || !layer_host_obj.affine_transform.is_identity()
+            {
+                return None;
+            }
+            layer = next;
+        } else {
+            let rot = classify_quarter_turn(layer_host_obj.affine_transform)?;
+            let (expected_w, expected_h) = match rot {
+                FullscreenEaglRotation::Identity | FullscreenEaglRotation::Rotate180 => {
+                    (screen_bounds.size.width, screen_bounds.size.height)
+                }
+                FullscreenEaglRotation::Rotate90Cw | FullscreenEaglRotation::Rotate90Ccw => {
+                    (screen_bounds.size.height, screen_bounds.size.width)
+                }
+            };
+            if (layer_host_obj.bounds.size.width - expected_w).abs() >= 0.5
+                || (layer_host_obj.bounds.size.height - expected_h).abs() >= 0.5
+                || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
+                || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
+                || (layer_host_obj.position.x - screen_bounds.size.width / 2.0).abs() >= 0.5
+                || (layer_host_obj.position.y - screen_bounds.size.height / 2.0).abs() >= 0.5
+                || layer_host_obj.hidden
+                || layer_host_obj.opacity != 1.0
+                || !layer_host_obj.animations.is_empty()
+                || !layer_host_obj.anonymous_animations.is_empty()
+            {
+                return None;
+            }
+            break rot;
+        }
+    };
+
+    if !env.objc.borrow::<CALayerHostObject>(layer).opaque {
+        return None;
+    }
+
+    let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
+    if !msg![env; layer isKindOfClass:ca_eagl_layer_class] {
+        return None;
+    }
+
+    Some((layer, rotation))
+}
+
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
 ///
@@ -46,81 +174,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// and present it directly from the app's context. This function is used to
 /// determine when that will happen.
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
-    if env.options.force_composition {
-        return nil;
-    }
-
-    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
-    // Assumes the windows in the list are ordered back-to-front.
-    // TODO: this may not be correct once we support windowLevel.
-    let Some(top_window) = windows
-        .into_iter()
-        .rev()
-        .find(|&window| !msg![env; window isHidden])
-    else {
-        return nil;
-    };
-
-    let screen_bounds: CGRect = {
-        let screen: id = msg_class![env; UIScreen mainScreen];
-        msg![env; screen bounds]
-    };
-
-    let mut layer: id = msg![env; top_window layer];
-
-    // Descend through the hierarchy, looking only at the last layer in each
-    // list of children, since that should be the one on top.
-    // TODO: this is not correct once we support zPosition.
-    loop {
-        assert!(layer != nil);
-
-        let layer_host_obj: &CALayerHostObject = env.objc.borrow(layer);
-
-        // This is stricter than it should be. In theory we should accumulate
-        // the transforms and handle different anchor points etc, but real apps
-        // probably only use this common case.
-        if layer_host_obj.bounds.size != screen_bounds.size
-            || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
-            || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
-            || layer_host_obj.position
-                != (CGPoint {
-                    x: screen_bounds.size.width / 2.0,
-                    y: screen_bounds.size.height / 2.0,
-                })
-            || layer_host_obj.hidden
-            || layer_host_obj.opacity != 1.0
-            // TODO: support affine transforms that result in a full-screen
-            //       layer (typical example is 90° rotation).
-            || !layer_host_obj.affine_transform.is_identity()
-        {
-            return nil;
-        }
-
-        // n72 fork: hidden or fully transparent sublayers draw nothing, so
-        // they must not stop the descent (Spore's GL layer carries a hidden
-        // news ticker as its last sublayer, which forced composition every
-        // frame).
-        let visible_last = layer_host_obj.sublayers.iter().rev().copied().find(|&sub| {
-            let h = env.objc.borrow::<CALayerHostObject>(sub);
-            !h.hidden && h.opacity > 0.0
-        });
-        if let Some(next) = visible_last {
-            layer = next;
-        } else {
-            break;
-        }
-    }
-
-    if !env.objc.borrow::<CALayerHostObject>(layer).opaque {
-        return nil;
-    }
-
-    let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
-    if !msg![env; layer isKindOfClass:ca_eagl_layer_class] {
-        return nil;
-    }
-
-    layer
+    find_fullscreen_eagl_layer_with_rotation(env).map_or(nil, |(l, _)| l)
 }
 
 /// n72 fork: like [find_fullscreen_eagl_layer], but allows visible overlay

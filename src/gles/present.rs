@@ -50,6 +50,23 @@ pub unsafe fn present_frame(
     rotation_matrix: Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
 ) {
+    let tex_coords: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    present_frame_with_tex_coords(
+        gles,
+        viewport,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        tex_coords,
+    );
+}
+
+pub unsafe fn present_frame_with_tex_coords(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    rotation_matrix: Matrix<2>,
+    virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    tex_coords: [f32; 12],
+) {
     // While this is a generic utility, it is closely tied to
     // crate::frameworks::opengles::eagl::present_renderbuffer, which handles
     // backing up and restoring OpenGL ES state that this function might touch,
@@ -72,7 +89,6 @@ pub unsafe fn present_frame(
     ];
     gles.EnableClientState(gles11::VERTEX_ARRAY);
     gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
-    let tex_coords: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
     gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
     let matrix = Matrix::<4>::from(&rotation_matrix);

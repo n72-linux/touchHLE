@@ -1658,6 +1658,8 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
         },
     ];
 
+    echo!("touchHLE error: {}", error_message);
+
     let Ok(clicked_button) = messagebox::show_message_box(
         messagebox::MessageBoxFlag::ERROR,
         &mbox,
@@ -1666,7 +1668,8 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
         window.map(|win| &win.window),
         None,
     ) else {
-        panic!("Failed to show message box!");
+        echo!("(Unable to show GUI message box on this video driver)");
+        return;
     };
 
     match clicked_button {
