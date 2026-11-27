@@ -48,6 +48,9 @@ pub const NSMacOSRomanStringEncoding: NSUInteger = 30;
 pub const NSUTF16StringEncoding: NSUInteger = NSUnicodeStringEncoding;
 pub const NSUTF16BigEndianStringEncoding: NSUInteger = 0x90000100;
 pub const NSUTF16LittleEndianStringEncoding: NSUInteger = 0x94000100;
+pub const NSUTF32StringEncoding: NSUInteger = 0x8c000100;
+pub const NSUTF32BigEndianStringEncoding: NSUInteger = 0x98000100;
+pub const NSUTF32LittleEndianStringEncoding: NSUInteger = 0x9c000100;
 
 pub type NSStringCompareOptions = NSUInteger;
 pub const NSCaseInsensitiveSearch: NSUInteger = 1;
@@ -167,6 +170,33 @@ impl StringHostObject {
                         .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
                         .collect()
                 })
+            }
+            NSUTF32StringEncoding
+            | NSUTF32BigEndianStringEncoding
+            | NSUTF32LittleEndianStringEncoding => {
+                assert!(bytes.len().is_multiple_of(4));
+                let (is_big_endian, start) = match encoding {
+                    NSUTF32BigEndianStringEncoding => (true, 0),
+                    NSUTF32LittleEndianStringEncoding => (false, 0),
+                    NSUTF32StringEncoding => match bytes.get(0..4) {
+                        Some([0x00, 0x00, 0xFE, 0xFF]) => (true, 4),
+                        Some([0xFF, 0xFE, 0x00, 0x00]) => (false, 4),
+                        _ => (false, 0),
+                    },
+                    _ => unreachable!(),
+                };
+                let string: String = bytes[start..]
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let code = if is_big_endian {
+                            u32::from_be_bytes(chunk.try_into().unwrap())
+                        } else {
+                            u32::from_le_bytes(chunk.try_into().unwrap())
+                        };
+                        char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
+                    })
+                    .collect();
+                StringHostObject::Utf8(Cow::Owned(string))
             }
             _ => panic!("Unimplemented encoding: {encoding:#x}"),
         }
@@ -492,6 +522,18 @@ pub const CLASSES: ClassExports = objc_classes! {
         let string = to_rust_string(env, this);
         assert!(string.as_bytes().iter().all(|byte| byte.is_ascii())); // TODO
         string.len().try_into().unwrap()
+    } else if matches!(
+        encoding,
+        NSUTF16StringEncoding | NSUTF16BigEndianStringEncoding | NSUTF16LittleEndianStringEncoding
+    ) {
+        let string = to_rust_string(env, this);
+        (string.encode_utf16().count() * 2).try_into().unwrap()
+    } else if matches!(
+        encoding,
+        NSUTF32StringEncoding | NSUTF32BigEndianStringEncoding | NSUTF32LittleEndianStringEncoding
+    ) {
+        let string = to_rust_string(env, this);
+        (string.chars().count() * 4).try_into().unwrap()
     } else {
         unimplemented!("lengthOfBytesUsingEncoding: {}", encoding)
     }
@@ -827,12 +869,24 @@ pub const CLASSES: ClassExports = objc_classes! {
         NSUTF8StringEncoding => {
             string.as_bytes().to_vec()
         },
-        NSUTF16LittleEndianStringEncoding => string.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        NSUTF16StringEncoding | NSUTF16LittleEndianStringEncoding => {
+            string.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        }
+        NSUTF16BigEndianStringEncoding => {
+            string.encode_utf16().flat_map(u16::to_be_bytes).collect()
+        }
+        NSUTF32StringEncoding | NSUTF32LittleEndianStringEncoding => {
+            string.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()
+        }
+        NSUTF32BigEndianStringEncoding => {
+            string.chars().flat_map(|c| (c as u32).to_be_bytes()).collect()
+        }
         _ => unimplemented!("{}", encoding),
     };
     let null_size: GuestUSize = match encoding {
         NSUTF8StringEncoding | NSASCIIStringEncoding | NSMacOSRomanStringEncoding | NSISOLatin1StringEncoding => 1,
-        NSUTF16LittleEndianStringEncoding => 2,
+        NSUTF16StringEncoding | NSUTF16LittleEndianStringEncoding | NSUTF16BigEndianStringEncoding => 2,
+        NSUTF32StringEncoding | NSUTF32LittleEndianStringEncoding | NSUTF32BigEndianStringEncoding => 4,
         _ => unimplemented!()
     };
     let bytes_size = bytes.len() as GuestUSize;
@@ -1320,6 +1374,36 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setString:res];
 }
 
+- (())insertString:(id)a_string // NSString*
+           atIndex:(NSUInteger)an_index {
+    assert_ne!(a_string, nil);
+    let length: NSUInteger = msg![env; this length];
+    assert!(an_index <= length);
+
+    let left: id = if an_index == 0 {
+        get_static_str(env, "")
+    } else {
+        let left_range = NSRange {
+            location: 0,
+            length: an_index,
+        };
+        msg![env; this substringWithRange:left_range]
+    };
+    let right: id = if an_index == length {
+        get_static_str(env, "")
+    } else {
+        let right_range = NSRange {
+            location: an_index,
+            length: length - an_index,
+        };
+        msg![env; this substringWithRange:right_range]
+    };
+
+    let left_and_inserted: id = msg![env; left stringByAppendingString:a_string];
+    let res: id = msg![env; left_and_inserted stringByAppendingString:right];
+    () = msg![env; this setString:res];
+}
+
 @end
 
 // Our private subclass that is the single implementation of NSString for the
@@ -1689,16 +1773,56 @@ fn data_using_encoding_lossy_inner(
         encoding == NSUTF8StringEncoding
             || encoding == NSASCIIStringEncoding
             || encoding == NSISOLatin1StringEncoding
+            || encoding == NSUTF16StringEncoding
+            || encoding == NSUTF16LittleEndianStringEncoding
+            || encoding == NSUTF16BigEndianStringEncoding
+            || encoding == NSUTF32StringEncoding
+            || encoding == NSUTF32LittleEndianStringEncoding
+            || encoding == NSUTF32BigEndianStringEncoding
     );
 
     let string = to_rust_string(env, this);
-    if encoding == NSASCIIStringEncoding || encoding == NSISOLatin1StringEncoding {
-        assert!(string.as_bytes().iter().all(|byte| byte.is_ascii()));
+    match encoding {
+        NSUTF8StringEncoding | NSASCIIStringEncoding | NSISOLatin1StringEncoding => {
+            if encoding == NSASCIIStringEncoding || encoding == NSISOLatin1StringEncoding {
+                assert!(string.as_bytes().iter().all(|byte| byte.is_ascii()));
+            }
+            let c_string = env.mem.alloc_and_write_cstr(string.as_bytes());
+            let length: NSUInteger = (string.len() + 1).try_into().unwrap();
+            msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void()) length:length]
+        }
+        NSUTF16StringEncoding
+        | NSUTF16LittleEndianStringEncoding
+        | NSUTF16BigEndianStringEncoding => {
+            let bytes: Vec<u8> = if encoding == NSUTF16BigEndianStringEncoding {
+                string.encode_utf16().flat_map(u16::to_be_bytes).collect()
+            } else {
+                string.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            };
+            let length: NSUInteger = bytes.len().try_into().unwrap();
+            let buf = env.mem.alloc(length.max(1));
+            if !bytes.is_empty() {
+                env.mem.bytes_at_mut(buf.cast(), length).copy_from_slice(&bytes);
+            }
+            msg_class![env; NSData dataWithBytesNoCopy:buf length:length]
+        }
+        NSUTF32StringEncoding
+        | NSUTF32LittleEndianStringEncoding
+        | NSUTF32BigEndianStringEncoding => {
+            let bytes: Vec<u8> = if encoding == NSUTF32BigEndianStringEncoding {
+                string.chars().flat_map(|c| (c as u32).to_be_bytes()).collect()
+            } else {
+                string.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()
+            };
+            let length: NSUInteger = bytes.len().try_into().unwrap();
+            let buf = env.mem.alloc(length.max(1));
+            if !bytes.is_empty() {
+                env.mem.bytes_at_mut(buf.cast(), length).copy_from_slice(&bytes);
+            }
+            msg_class![env; NSData dataWithBytesNoCopy:buf length:length]
+        }
+        _ => unreachable!(),
     }
-    let c_string = env.mem.alloc_and_write_cstr(string.as_bytes());
-    let length: NSUInteger = (string.len() + 1).try_into().unwrap();
-
-    msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void()) length:length]
 }
 
 /// For use by [crate::dyld]: Handle static strings listed in the app binary.
@@ -2034,6 +2158,27 @@ pub fn get_bytes_buffer_inner(
     include_null_terminator: bool,
 ) -> bool {
     // TODO: other encodings
+    let src = to_rust_string(env, str);
+    if matches!(
+        encoding,
+        NSUTF32StringEncoding | NSUTF32LittleEndianStringEncoding | NSUTF32BigEndianStringEncoding
+    ) {
+        let mut encoded: Vec<u8> = if encoding == NSUTF32BigEndianStringEncoding {
+            src.chars().flat_map(|c| (c as u32).to_be_bytes()).collect()
+        } else {
+            src.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()
+        };
+        if include_null_terminator {
+            encoded.extend_from_slice(&[0u8; 4]);
+        }
+        let dest = env.mem.bytes_at_mut(buffer, buffer_size);
+        if dest.len() < encoded.len() {
+            return false;
+        }
+        dest[..encoded.len()].copy_from_slice(&encoded);
+        return true;
+    }
+
     assert!(
         encoding == NSUTF8StringEncoding
             || encoding == NSASCIIStringEncoding
@@ -2041,7 +2186,6 @@ pub fn get_bytes_buffer_inner(
             || encoding == NSISOLatin1StringEncoding
     );
 
-    let src = to_rust_string(env, str);
     if encoding == NSASCIIStringEncoding
         || encoding == NSMacOSRomanStringEncoding
         || encoding == NSISOLatin1StringEncoding

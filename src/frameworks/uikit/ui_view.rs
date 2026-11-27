@@ -65,6 +65,7 @@ const UIViewAnimationCurveEaseInOut: UIViewAnimationCurve = 0;
 const UIViewAnimationCurveEaseIn: UIViewAnimationCurve = 1;
 const UIViewAnimationCurveEaseOut: UIViewAnimationCurve = 2;
 const UIViewAnimationCurveLinear: UIViewAnimationCurve = 3;
+type UIViewAnimationTransition = NSInteger;
 
 #[derive(Default)]
 pub struct State {
@@ -226,6 +227,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("[UIView setAnimationDidStopSelector:{:?} ({})]", selector, selector_str);
     let selector_nsstring = from_rust_string(env, selector_str.to_string());
     () = msg_class![env; CATransaction setValue:selector_nsstring forKey:(get_static_str(env, touchHLE_kCATransactionAnimationDidStopSelector))];
+}
+
++ (())setAnimationTransition:(UIViewAnimationTransition)transition
+                     forView:(id)view // UIView*
+                       cache:(bool)cache {
+    log!("TODO: [UIView setAnimationTransition:{:?} forView:{:?} cache:{}]", transition, view, cache);
 }
 
 + (())beginAnimations:(id)animation_id // NSString*
@@ -453,9 +460,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)window {
-    // Looks up window in the superview hierarchy
+    // Looks up window in the superview hierarchy (or self if this is a UIWindow)
     // TODO: cache the result somehow?
-    let mut window: id = env.objc.borrow::<UIViewHostObject>(this).superview;
+    let mut window: id = this;
     let window_class = env.objc.get_known_class("UIWindow", &mut env.mem);
     while window != nil {
         let current_class: Class = msg![env; window class];
@@ -849,46 +856,46 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGPoint)convertPoint:(CGPoint)point
                fromView:(id)other { // UIView*
-    if other == nil {
-        let window: id = msg![env; this window];
-        assert!(window != nil);
-        return msg![env; this convertPoint:point fromView:window]
-    }
+    let other = if other == nil { msg![env; this window] } else { other };
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    let other_layer = if other == nil {
+        nil
+    } else {
+        env.objc.borrow::<UIViewHostObject>(other).layer
+    };
     msg![env; this_layer convertPoint:point fromLayer:other_layer]
 }
 - (CGPoint)convertPoint:(CGPoint)point
                  toView:(id)other { // UIView*
-    if other == nil {
-        let window: id = msg![env; this window];
-        assert!(window != nil);
-        return msg![env; this convertPoint:point toView:window]
-    }
+    let other = if other == nil { msg![env; this window] } else { other };
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    let other_layer = if other == nil {
+        nil
+    } else {
+        env.objc.borrow::<UIViewHostObject>(other).layer
+    };
     msg![env; this_layer convertPoint:point toLayer:other_layer]
 }
 - (CGRect)convertRect:(CGRect)rect
              fromView:(id)other { // UIView*
-    if other == nil {
-        let window: id = msg![env; this window];
-        assert!(window != nil);
-        return msg![env; this convertRect:rect fromView:window]
-    }
+    let other = if other == nil { msg![env; this window] } else { other };
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    let other_layer = if other == nil {
+        nil
+    } else {
+        env.objc.borrow::<UIViewHostObject>(other).layer
+    };
     msg![env; this_layer convertRect:rect fromLayer:other_layer]
 }
 - (CGRect)convertRect:(CGRect)rect
                toView:(id)other { // UIView*
-    if other == nil {
-        let window: id = msg![env; this window];
-        assert!(window != nil);
-        return msg![env; this convertRect:rect toView:window]
-    }
+    let other = if other == nil { msg![env; this window] } else { other };
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
+    let other_layer = if other == nil {
+        nil
+    } else {
+        env.objc.borrow::<UIViewHostObject>(other).layer
+    };
     msg![env; this_layer convertRect:rect toLayer:other_layer]
 }
 

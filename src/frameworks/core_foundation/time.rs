@@ -5,7 +5,7 @@
  */
 //! Time things including `CFAbsoluteTime`.
 
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::CFTypeRef;
 use crate::frameworks::foundation::NSTimeInterval;
 use crate::libc::time::{time_t, timestamp_to_calendar_date};
@@ -82,6 +82,16 @@ fn CFAbsoluteTimeGetDayOfWeek(env: &mut Environment, at: CFAbsoluteTime, tz: CFT
     assert!(tz.is_null());
     CFAbsoluteTimeGetGregorianDate(env, at, tz).day.into()
 }
+
+pub const CONSTANTS: ConstantExports = &[(
+    "_kCFAbsoluteTimeIntervalSince1970",
+    HostConstant::Custom(|env| {
+        env.mem
+            .alloc_and_write(SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64)
+            .cast_void()
+            .cast_const()
+    }),
+)];
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFAbsoluteTimeGetCurrent()),

@@ -6,8 +6,14 @@
 //! `dlfcn.h` (`dlopen()` and friends)
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
+use std::collections::HashMap;
+
+#[derive(Default)]
+pub struct State {
+    fname_cache: HashMap<u32, ConstPtr<u8>>,
+}
 
 const RTLD_DEFAULT: MutVoidPtr = Ptr::from_bits(-2 as _);
 
@@ -54,8 +60,54 @@ fn dlclose(env: &mut Environment, handle: MutVoidPtr) -> i32 {
     0 // success
 }
 
+#[repr(C, packed)]
+struct DlInfo {
+    dli_fname: ConstPtr<u8>,
+    dli_fbase: ConstVoidPtr,
+    dli_sname: ConstPtr<u8>,
+    dli_saddr: ConstVoidPtr,
+}
+unsafe impl SafeRead for DlInfo {}
+
+fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutPtr<DlInfo>) -> i32 {
+    let addr_bits = addr.to_bits() & !1; // clear Thumb bit if set
+    let matched = env.bins.iter().find_map(|bin| {
+        let base = bin.text_segment_base;
+        if addr_bits >= base && addr_bits < bin.last_segment_end {
+            Some((base, bin.name.clone()))
+        } else {
+            None
+        }
+    });
+    if let Some((base, name)) = matched {
+        let dli_fname = if let Some(&cached) = env.libc_state.dlfcn.fname_cache.get(&base) {
+            cached
+        } else {
+            let ptr = env.mem.alloc_and_write_cstr(name.as_bytes()).cast_const();
+            env.libc_state.dlfcn.fname_cache.insert(base, ptr);
+            ptr
+        };
+        let dli_fbase = Ptr::from_bits(base);
+        env.mem.write(
+            info,
+            DlInfo {
+                dli_fname,
+                dli_fbase,
+                dli_sname: Ptr::null(),
+                dli_saddr: Ptr::null(),
+            },
+        );
+        log_dbg!("dladdr({:?}) -> dli_fbase {:?} ({})", addr, dli_fbase, name);
+        1
+    } else {
+        log_dbg!("dladdr({:?}) -> 0 (not found)", addr);
+        0
+    }
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(dlopen(_, _)),
     export_c_func!(dlsym(_, _)),
     export_c_func!(dlclose(_)),
+    export_c_func!(dladdr(_, _)),
 ];

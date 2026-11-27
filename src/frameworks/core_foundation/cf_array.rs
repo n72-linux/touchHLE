@@ -115,6 +115,10 @@ fn CFArrayRemoveValueAtIndex(env: &mut Environment, array: CFMutableArrayRef, id
     msg![env; array removeObjectAtIndex:idx]
 }
 
+fn CFArrayRemoveAllValues(env: &mut Environment, array: CFMutableArrayRef) {
+    () = msg![env; array removeAllObjects];
+}
+
 fn _touchHLE_CFArray_retain(
     env: &mut Environment,
     allocator: CFAllocatorRef,
@@ -185,4 +189,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFArrayGetValueAtIndex(_, _)),
     export_c_func!(CFArrayAppendValue(_, _)),
     export_c_func!(CFArrayRemoveValueAtIndex(_, _)),
+    export_c_func!(CFArrayRemoveAllValues(_)),
 ];

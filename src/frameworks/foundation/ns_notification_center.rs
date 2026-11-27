@@ -7,6 +7,7 @@
 
 use super::ns_notification::NSNotificationName;
 use super::ns_string;
+use crate::Environment;
 
 use crate::objc::{
     id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -18,6 +19,31 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct State {
     default_center: Option<id>,
+    /// Count of active registrations per observer object across all centers
+    /// (O(1) check in `NSObject -dealloc`).
+    observer_counts: crate::objc::PtrMap<id, u32>,
+}
+impl State {
+    pub(super) fn has_observer(&self, observer: id) -> bool {
+        self.observer_counts.contains_key(&observer)
+    }
+    pub(super) fn default_center_if_exists(&self) -> Option<id> {
+        self.default_center
+    }
+}
+
+fn decrement_observer_count(env: &mut Environment, observer: id, count: u32) {
+    if count == 0 || observer == nil {
+        return;
+    }
+    let counts = &mut env.framework_state.foundation.ns_notification_center.observer_counts;
+    if let Some(entry) = counts.get_mut(&observer) {
+        if *entry <= count {
+            counts.remove(&observer);
+        } else {
+            *entry -= count;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +85,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
     let observers = std::mem::take(&mut host_obj.observers);
     for observer in observers.values().flatten() {
+        decrement_observer_count(env, observer.observer, 1);
         release(env, observer.object);
     }
     env.objc.dealloc_object(this, &mut env.mem);
@@ -102,6 +129,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     // (Pandemonium and COD Zombies, for example).
 
     retain(env, object);
+
+    if observer != nil {
+        env.framework_state
+            .foundation
+            .ns_notification_center
+            .observer_counts
+            .entry(observer)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
 
     let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
     host_obj.observers.entry(name).or_default().push(Observer {
@@ -151,6 +188,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     };
 
+    decrement_observer_count(env, observer, removed_observers.len() as u32);
     for removed_observer in removed_observers {
         release(env, removed_observer.object);
     }
@@ -189,6 +227,20 @@ pub const CLASSES: ClassExports = objc_classes! {
             selector.as_str(&env.mem),
             observer
         );
+
+        if env.objc.get_host_object(observer).is_none()
+            || !env
+                .framework_state
+                .foundation
+                .ns_notification_center
+                .has_observer(observer)
+        {
+            log!(
+                "Warning: skipping deallocated or removed NSNotificationCenter observer {:?}",
+                observer
+            );
+            continue;
+        }
 
         // In some cases, observer could be removed during the
         // processing of the notification, effectively releasing it.

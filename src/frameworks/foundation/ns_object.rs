@@ -127,6 +127,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[{:?} dealloc]", this);
+    if env.framework_state.foundation.ns_notification_center.has_observer(this) {
+        if let Some(center) = env
+            .framework_state
+            .foundation
+            .ns_notification_center
+            .default_center_if_exists()
+        {
+            log_dbg!(
+                "Auto-removing deallocated observer {:?} from NSNotificationCenter",
+                this
+            );
+            () = msg![env; center removeObserver:this];
+        }
+    }
     env.objc.dealloc_object(this, &mut env.mem)
 }
 

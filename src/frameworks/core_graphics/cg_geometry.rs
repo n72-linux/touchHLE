@@ -354,6 +354,50 @@ fn CGRectIsNull(_env: &mut Environment, rect: CGRect) -> bool {
     rect == CGRectNull
 }
 
+fn CGRectIsEmpty(_env: &mut Environment, rect: CGRect) -> bool {
+    rect == CGRectNull || rect.size.width == 0.0 || rect.size.height == 0.0
+}
+
+fn CGRectUnion(_env: &mut Environment, r1: CGRect, r2: CGRect) -> CGRect {
+    if r1 == CGRectNull {
+        return r2;
+    }
+    if r2 == CGRectNull {
+        return r1;
+    }
+    let min_x = r1
+        .origin
+        .x
+        .min(r1.origin.x + r1.size.width)
+        .min(r2.origin.x)
+        .min(r2.origin.x + r2.size.width);
+    let min_y = r1
+        .origin
+        .y
+        .min(r1.origin.y + r1.size.height)
+        .min(r2.origin.y)
+        .min(r2.origin.y + r2.size.height);
+    let max_x = r1
+        .origin
+        .x
+        .max(r1.origin.x + r1.size.width)
+        .max(r2.origin.x)
+        .max(r2.origin.x + r2.size.width);
+    let max_y = r1
+        .origin
+        .y
+        .max(r1.origin.y + r1.size.height)
+        .max(r2.origin.y)
+        .max(r2.origin.y + r2.size.height);
+    CGRect {
+        origin: CGPoint { x: min_x, y: min_y },
+        size: CGSize {
+            width: max_x - min_x,
+            height: max_y - min_y,
+        },
+    }
+}
+
 fn CGRectOffset(_env: &mut Environment, rect: CGRect, dx: CGFloat, dy: CGFloat) -> CGRect {
     assert!(rect != CGRectNull); // TODO
     CGRect {
@@ -424,6 +468,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGRectGetWidth(_)),
     export_c_func!(CGRectMake(_, _, _, _)),
     export_c_func!(CGRectIsNull(_)),
+    export_c_func!(CGRectIsEmpty(_)),
+    export_c_func!(CGRectUnion(_, _)),
     export_c_func!(CGRectOffset(_, _, _)),
     export_c_func!(CGRectInset(_, _, _)),
     export_c_func!(CGRectIntegral(_)),

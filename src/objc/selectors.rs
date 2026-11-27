@@ -290,3 +290,11 @@ pub(super) fn sel_registerName(env: &mut Environment, name: ConstPtr<u8>) -> SEL
     let name = name.to_string();
     env.objc.register_host_selector(name, &mut env.mem)
 }
+
+pub(super) fn sel_getUid(env: &mut Environment, name: ConstPtr<u8>) -> SEL {
+    sel_registerName(env, name)
+}
+
+pub(super) fn sel_getName(_env: &mut Environment, sel: SEL) -> ConstPtr<u8> {
+    sel.0
+}

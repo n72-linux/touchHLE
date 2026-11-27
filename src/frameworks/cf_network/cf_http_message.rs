@@ -11,15 +11,17 @@ use crate::frameworks::core_foundation::cf_allocator::{kCFAllocatorDefault, CFAl
 use crate::frameworks::core_foundation::cf_data::CFDataRef;
 use crate::frameworks::core_foundation::cf_string::CFStringRef;
 use crate::frameworks::core_foundation::cf_url::CFURLRef;
-use crate::frameworks::core_foundation::{CFOptionFlags, CFTypeRef};
+use crate::frameworks::core_foundation::{CFIndex, CFOptionFlags, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
-use crate::mem::{MutVoidPtr, Ptr};
+use crate::mem::{MutPtr, MutVoidPtr, Ptr};
 use crate::objc::msg;
 use crate::Environment;
 
 // Note: on iOS SDK side this type is defined as a pointer to an opaque struct
 type CFHTTPMessageRef = CFTypeRef;
 type CFReadStreamRef = CFTypeRef;
+type CFWriteStreamRef = CFTypeRef;
+type CFHostRef = CFTypeRef;
 
 fn CFHTTPMessageCreateRequest(
     env: &mut Environment,
@@ -112,6 +114,124 @@ fn CFReadStreamSetClient(
     false
 }
 
+fn CFHostCreateWithName(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    hostname: CFStringRef,
+) -> CFHostRef {
+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default());
+    log_once!("TODO: CFHostCreateWithName() -> NULL (ignoring host lookups)");
+    log_dbg!(
+        "TODO: CFHostCreateWithName('{}') -> NULL",
+        ns_string::to_rust_string(env, hostname)
+    );
+    Ptr::null()
+}
+
+fn CFStreamCreatePairWithSocketToCFHost(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    host: CFHostRef,
+    port: i32,
+    read_stream: MutPtr<CFReadStreamRef>,
+    write_stream: MutPtr<CFWriteStreamRef>,
+) {
+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default());
+    log!(
+        "TODO: CFStreamCreatePairWithSocketToCFHost({:?}, {})",
+        host,
+        port
+    );
+    if !read_stream.is_null() {
+        env.mem.write(read_stream, Ptr::null());
+    }
+    if !write_stream.is_null() {
+        env.mem.write(write_stream, Ptr::null());
+    }
+}
+
+fn CFReadStreamCreateForStreamedHTTPRequest(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    request_headers: CFHTTPMessageRef,
+    _request_body: CFReadStreamRef,
+) -> CFReadStreamRef {
+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default());
+    if !request_headers.is_null() {
+        todo!(
+            "CFReadStreamCreateForStreamedHTTPRequest({:?}, {:?})",
+            allocator,
+            request_headers,
+        );
+    }
+    Ptr::null()
+}
+
+fn CFReadStreamOpen(_env: &mut Environment, stream: CFReadStreamRef) -> bool {
+    assert!(stream.is_null());
+    false
+}
+
+fn CFReadStreamClose(_env: &mut Environment, stream: CFReadStreamRef) {
+    assert!(stream.is_null());
+}
+
+fn CFReadStreamScheduleWithRunLoop(
+    _env: &mut Environment,
+    stream: CFReadStreamRef,
+    _run_loop: CFTypeRef,
+    _run_loop_mode: CFStringRef,
+) {
+    assert!(stream.is_null());
+}
+
+fn CFReadStreamUnscheduleFromRunLoop(
+    _env: &mut Environment,
+    stream: CFReadStreamRef,
+    _run_loop: CFTypeRef,
+    _run_loop_mode: CFStringRef,
+) {
+    assert!(stream.is_null());
+}
+
+fn CFReadStreamRead(
+    _env: &mut Environment,
+    stream: CFReadStreamRef,
+    _buffer: MutPtr<u8>,
+    _buffer_length: CFIndex,
+) -> CFIndex {
+    assert!(stream.is_null());
+    -1
+}
+
+fn CFReadStreamCopyProperty(
+    _env: &mut Environment,
+    stream: CFReadStreamRef,
+    _property_name: CFStringRef,
+) -> CFTypeRef {
+    assert!(stream.is_null());
+    Ptr::null()
+}
+
+fn CFReadStreamCopyError(_env: &mut Environment, stream: CFReadStreamRef) -> CFTypeRef {
+    assert!(stream.is_null());
+    Ptr::null()
+}
+
+fn CFWriteStreamOpen(_env: &mut Environment, stream: CFWriteStreamRef) -> bool {
+    assert!(stream.is_null());
+    false
+}
+
+fn CFWriteStreamClose(_env: &mut Environment, stream: CFWriteStreamRef) {
+    assert!(stream.is_null());
+}
+
+fn CFWriteStreamGetStatus(_env: &mut Environment, stream: CFWriteStreamRef) -> CFIndex {
+    assert!(stream.is_null());
+    0
+}
+
 const kCFHTTPVersion1_0: &str = "kCFHTTPVersion1_0";
 const kCFHTTPVersion1_1: &str = "kCFHTTPVersion1_1";
 
@@ -175,4 +295,17 @@ pub const FUNCTIONS: FunctionExports = &[
     // TODO: move to correct location
     export_c_func!(CFReadStreamSetProperty(_, _, _)),
     export_c_func!(CFReadStreamSetClient(_, _, _, _)),
+    export_c_func!(CFHostCreateWithName(_, _)),
+    export_c_func!(CFStreamCreatePairWithSocketToCFHost(_, _, _, _, _)),
+    export_c_func!(CFReadStreamCreateForStreamedHTTPRequest(_, _, _)),
+    export_c_func!(CFReadStreamOpen(_)),
+    export_c_func!(CFReadStreamClose(_)),
+    export_c_func!(CFReadStreamScheduleWithRunLoop(_, _, _)),
+    export_c_func!(CFReadStreamUnscheduleFromRunLoop(_, _, _)),
+    export_c_func!(CFReadStreamRead(_, _, _)),
+    export_c_func!(CFReadStreamCopyProperty(_, _)),
+    export_c_func!(CFReadStreamCopyError(_)),
+    export_c_func!(CFWriteStreamOpen(_)),
+    export_c_func!(CFWriteStreamClose(_)),
+    export_c_func!(CFWriteStreamGetStatus(_)),
 ];

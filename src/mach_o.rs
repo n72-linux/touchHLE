@@ -55,6 +55,8 @@ pub struct MachO {
     /// This is used by get_end() to return the first address after the last
     /// segment in the executable.
     pub last_segment_end: u32,
+    /// Base address of the `__TEXT` segment (Mach-O header address in guest memory).
+    pub text_segment_base: u32,
 }
 
 #[derive(Debug)]
@@ -710,6 +712,7 @@ impl MachO {
             external_relocations,
             entry_point_pc,
             last_segment_end,
+            text_segment_base: text_segment_base.unwrap(),
         })
     }
 
