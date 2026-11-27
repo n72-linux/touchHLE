@@ -19,6 +19,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct State {
     default_center: Option<id>,
+    centers: Vec<id>,
     /// Count of active registrations per observer object across all centers
     /// (O(1) check in `NSObject -dealloc`).
     observer_counts: crate::objc::PtrMap<id, u32>,
@@ -27,8 +28,21 @@ impl State {
     pub(super) fn has_observer(&self, observer: id) -> bool {
         self.observer_counts.contains_key(&observer)
     }
-    pub(super) fn default_center_if_exists(&self) -> Option<id> {
-        self.default_center
+    pub(super) fn remove_observer_from_all_centers(env: &mut Environment, observer: id) {
+        let centers = env
+            .framework_state
+            .foundation
+            .ns_notification_center
+            .centers
+            .clone();
+        for center in centers {
+            log_dbg!(
+                "Auto-removing deallocated observer {:?} from NSNotificationCenter {:?}",
+                observer,
+                center
+            );
+            () = msg![env; center removeObserver:observer];
+        }
     }
 }
 
@@ -68,7 +82,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSNotificationCenterHostObject {
         observers: HashMap::new(),
     });
-    env.objc.alloc_object(this, host_object, &mut env.mem)
+    let center = env.objc.alloc_object(this, host_object, &mut env.mem);
+    env.framework_state
+        .foundation
+        .ns_notification_center
+        .centers
+        .push(center);
+    center
 }
 
 + (id)defaultCenter {
@@ -82,6 +102,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
+    env.framework_state
+        .foundation
+        .ns_notification_center
+        .centers
+        .retain(|&c| c != this);
     let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
     let observers = std::mem::take(&mut host_obj.observers);
     for observer in observers.values().flatten() {

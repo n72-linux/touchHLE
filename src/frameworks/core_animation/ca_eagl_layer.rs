@@ -117,6 +117,8 @@ pub fn find_fullscreen_eagl_layer_with_rotation(
                 || layer_host_obj.hidden
                 || layer_host_obj.opacity != 1.0
                 || !layer_host_obj.affine_transform.is_identity()
+                || !layer_host_obj.animations.is_empty()
+                || !layer_host_obj.anonymous_animations.is_empty()
             {
                 return None;
             }

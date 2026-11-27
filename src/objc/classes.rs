@@ -1014,7 +1014,12 @@ pub(super) fn objc_getClass(env: &mut Environment, name: ConstPtr<u8>) -> id {
 }
 
 pub(super) fn objc_lookUpClass(env: &mut Environment, name: ConstPtr<u8>) -> Class {
-    let name_str = env.mem.cstr_at_utf8(name).unwrap();
+    if name.is_null() {
+        return nil;
+    }
+    let Ok(name_str) = env.mem.cstr_at_utf8(name) else {
+        return nil;
+    };
     env.objc.get_class(name_str, false, &env.mem).unwrap_or(nil)
 }
 

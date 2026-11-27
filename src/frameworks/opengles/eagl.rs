@@ -309,15 +309,26 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
+    if crate::window::Window::fixed_portrait_panel() {
+        n72_resolve_discard(env.window.as_ref().unwrap());
+    }
+    let panel_size = env.window.as_ref().unwrap().size_unrotated_unscaled();
+
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, window, env.current_thread);
 
-    let renderbuffer: GLuint = unsafe {
+    let (renderbuffer, cur_win_rot) = unsafe {
         let mut renderbuffer = 0;
         gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut renderbuffer);
-        renderbuffer as _
+        let rb = renderbuffer as GLuint;
+        let rot = if crate::window::Window::fixed_portrait_panel() {
+            n72_window_backed_rotation(rb)
+        } else {
+            None
+        };
+        (rb, rot)
     };
 
     std::mem::drop(gles);
@@ -336,10 +347,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // the renderbuffer's contents are undefined after presenting, as on iOS:
     // n72-gles is told so (glDiscardFramebufferEXT) once the frame is copied,
     // and the next frame skips reloading the old pixels on the GPU.
-    let n72_discard = crate::window::Window::fixed_portrait_panel() && {
-        n72_resolve_discard(env.window.as_ref().unwrap());
-        !n72_retained_backing(env, drawable)
-    };
+    let n72_discard = crate::window::Window::fixed_portrait_panel()
+        && !n72_retained_backing(env, drawable);
     N72_DISCARD_NEXT.store(n72_discard, std::sync::atomic::Ordering::Relaxed);
 
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
@@ -354,7 +363,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // it straight into the panel's back buffer), presenting is a swap.
         // Works for both unrotated and rotated fullscreen layers matching the panel size.
         if crate::window::Window::fixed_portrait_panel()
-            && n72_window_backed_rotation(renderbuffer) == Some(fullscreen_rotation)
+            && cur_win_rot == Some(fullscreen_rotation)
         {
             set_layer_window_backed(env, drawable, true);
             drop(super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread));
@@ -364,25 +373,26 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             return true;
         } else {
-            if crate::window::Window::fixed_portrait_panel() && n72_is_window_backed(renderbuffer) {
+            if crate::window::Window::fixed_portrait_panel() && cur_win_rot.is_some() {
                 let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-                unsafe { n72_set_window_backed_rot(gles.as_mut(), renderbuffer, None) };
+                unsafe { n72_set_window_backed_rot(gles.as_mut(), renderbuffer, None, panel_size) };
             }
             unsafe {
                 present_renderbuffer(env, fullscreen_rotation);
             }
             if crate::window::Window::fixed_portrait_panel() {
-                {
+                let backed = {
                     let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
                     unsafe {
                         n72_set_window_backed_rot(
                             gles.as_mut(),
                             renderbuffer,
                             Some(fullscreen_rotation),
+                            panel_size,
                         )
-                    };
-                }
-                set_layer_window_backed(env, drawable, n72_is_window_backed(renderbuffer));
+                    }
+                };
+                set_layer_window_backed(env, drawable, backed);
             }
         }
     } else {
@@ -393,9 +403,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         if fullscreen_layer == nil && crate::window::Window::fixed_portrait_panel() {
             if let Some((base, overlay_roots)) = find_fullscreen_eagl_base(env) {
                 if base == drawable {
-                    if n72_window_backed_rotation(renderbuffer)
-                        == Some(FullscreenEaglRotation::Identity)
-                    {
+                    if cur_win_rot == Some(FullscreenEaglRotation::Identity) {
                         set_layer_window_backed(env, drawable, true);
                         drop(super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread));
                         use crate::frameworks::core_animation as ca;
@@ -443,11 +451,11 @@ pub const CLASSES: ClassExports = objc_classes! {
                     crate::frameworks::core_animation::ca_eagl_layer::present_texture(env, drawable, texture, width, height);
                     set_layer_window_backed(env, drawable, false);
                     crate::frameworks::core_animation::recomposite_if_necessary(env, true);
-                    {
+                    let backed = {
                         let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-                        unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, true) };
-                    }
-                    set_layer_window_backed(env, drawable, n72_is_window_backed(renderbuffer));
+                        unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, true, panel_size) }
+                    };
+                    set_layer_window_backed(env, drawable, backed);
                     if let Some(sleep_for) = sleep_for {
                         env.sleep(sleep_for);
                     }
@@ -456,14 +464,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
 
-        if crate::window::Window::fixed_portrait_panel() && n72_is_window_backed(renderbuffer) {
+        if crate::window::Window::fixed_portrait_panel() && cur_win_rot.is_some() {
             // Not the only layer any more: back to the renderbuffer's own
             // storage (this frame is in the panel buffer: copy it out first
             // below, or drop it when this layer is hidden anyway).
             if fullscreen_layer != nil {
                 {
                     let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-                    unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false) };
+                    unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false, panel_size) };
                 }
                 set_layer_window_backed(env, drawable, false);
             }
@@ -504,8 +512,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             let (texture, width, height) = {
                 let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
                 let r = unsafe { copy_renderbuffer_to_texture(gles.as_mut(), existing, opaque) };
-                if n72_is_window_backed(renderbuffer) {
-                    unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false) };
+                if cur_win_rot.is_some() {
+                    unsafe { n72_set_window_backed(gles.as_mut(), renderbuffer, false, panel_size) };
                 }
                 r
             };
@@ -806,25 +814,39 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
 
 /// n72 fork: renderbuffers n72-gles draws straight into the panel's back
 /// buffer (`glRenderbufferWindowBackedN72` / `glRenderbufferWindowBackedRotatedN72`).
-/// Names are per context; the device panel only runs apps with one rendering
-/// context in practice, and a name from another context just takes the normal path.
+/// When `glGetRenderbufferWindowBackedRotatedN72` is offered, queries go
+/// straight to the driver for the current context without touching GL error state;
+/// otherwise fall back to the legacy per-name table.
 static N72_WINDOW_BACKED: std::sync::Mutex<Vec<(GLuint, FullscreenEaglRotation)>> =
     std::sync::Mutex::new(Vec::new());
 static N72_WINDOW_BACKED_FN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 static N72_WINDOW_BACKED_ROT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(1);
+static N72_WINDOW_BACKED_GET_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
 
-fn n72_window_backed_rotation(renderbuffer: GLuint) -> Option<FullscreenEaglRotation> {
+fn n72_rotation_from_code(code: GLint) -> Option<FullscreenEaglRotation> {
+    match code {
+        0 => Some(FullscreenEaglRotation::Identity),
+        1 => Some(FullscreenEaglRotation::Rotate90Cw),
+        2 => Some(FullscreenEaglRotation::Rotate180),
+        3 => Some(FullscreenEaglRotation::Rotate90Ccw),
+        _ => None,
+    }
+}
+
+unsafe fn n72_window_backed_rotation(renderbuffer: GLuint) -> Option<FullscreenEaglRotation> {
+    let f_get = N72_WINDOW_BACKED_GET_FN.load(std::sync::atomic::Ordering::Relaxed);
+    if f_get > 1 {
+        let get_rot: extern "C" fn(GLuint) -> GLint = std::mem::transmute(f_get);
+        return n72_rotation_from_code(get_rot(renderbuffer));
+    }
     N72_WINDOW_BACKED
         .lock()
         .unwrap()
         .iter()
         .find(|&&(r, _)| r == renderbuffer)
         .map(|&(_, rot)| rot)
-}
-
-fn n72_is_window_backed(renderbuffer: GLuint) -> bool {
-    n72_window_backed_rotation(renderbuffer).is_some()
 }
 
 fn n72_rotation_code(rot: FullscreenEaglRotation) -> GLint {
@@ -836,32 +858,69 @@ fn n72_rotation_code(rot: FullscreenEaglRotation) -> GLint {
     }
 }
 
-unsafe fn n72_set_window_backed(gles: &mut dyn GLES, renderbuffer: GLuint, on: bool) {
+unsafe fn n72_set_window_backed(
+    gles: &mut dyn GLES,
+    renderbuffer: GLuint,
+    on: bool,
+    panel_size: (u32, u32),
+) -> bool {
     n72_set_window_backed_rot(
         gles,
         renderbuffer,
         on.then_some(FullscreenEaglRotation::Identity),
-    );
+        panel_size,
+    )
 }
 
 unsafe fn n72_set_window_backed_rot(
     gles: &mut dyn GLES,
     renderbuffer: GLuint,
     rot: Option<FullscreenEaglRotation>,
-) {
+    panel_size: (u32, u32),
+) -> bool {
     let f_rot = N72_WINDOW_BACKED_ROT_FN.load(std::sync::atomic::Ordering::Relaxed);
+    let f_get = N72_WINDOW_BACKED_GET_FN.load(std::sync::atomic::Ordering::Relaxed);
     let f = N72_WINDOW_BACKED_FN.load(std::sync::atomic::Ordering::Relaxed);
     let code = rot.map_or(-1, n72_rotation_code);
-    // Keep the app's error state: report only our own call's result.
-    let pending = gles.GetError();
+    if f_rot > 1 && f_get > 1 {
+        if let Some(r) = rot {
+            let (rw, rh) = get_renderbuffer_size(gles);
+            let (ew, eh) = match r {
+                FullscreenEaglRotation::Identity | FullscreenEaglRotation::Rotate180 => {
+                    (panel_size.0 as GLsizei, panel_size.1 as GLsizei)
+                }
+                FullscreenEaglRotation::Rotate90Cw | FullscreenEaglRotation::Rotate90Ccw => {
+                    (panel_size.1 as GLsizei, panel_size.0 as GLsizei)
+                }
+            };
+            if rw != ew || rh != eh {
+                return false;
+            }
+        }
+        let set_rot: extern "C" fn(GLuint, GLint) = std::mem::transmute(f_rot);
+        let get_rot: extern "C" fn(GLuint) -> GLint = std::mem::transmute(f_get);
+        set_rot(renderbuffer, code);
+        let now = get_rot(renderbuffer);
+        if let Some(r) = rot {
+            if now == n72_rotation_code(r) {
+                log!(
+                    "n72: renderbuffer {} is window-backed rot={} (presents are swaps)",
+                    renderbuffer,
+                    code
+                );
+                return true;
+            }
+        }
+        return false;
+    }
     let ok = if f_rot > 1 {
         let set_rot: extern "C" fn(GLuint, GLint) = std::mem::transmute(f_rot);
         set_rot(renderbuffer, code);
-        gles.GetError() == gles11::NO_ERROR
+        true
     } else if f > 1 && (rot.is_none() || rot == Some(FullscreenEaglRotation::Identity)) {
         let set: extern "C" fn(GLuint, u8) = std::mem::transmute(f);
         set(renderbuffer, rot.is_some() as u8);
-        gles.GetError() == gles11::NO_ERROR
+        true
     } else {
         false
     };
@@ -875,9 +934,10 @@ unsafe fn n72_set_window_backed_rot(
                 renderbuffer,
                 code
             );
+            return true;
         }
     }
-    let _ = pending;
+    false
 }
 
 /// n72 fork: whether the current present may discard the renderbuffer.
@@ -893,6 +953,8 @@ fn n72_resolve_discard(window: &crate::window::Window) {
         N72_WINDOW_BACKED_FN.store(f as usize, std::sync::atomic::Ordering::Relaxed);
         let f = window.gl_get_proc_address("glRenderbufferWindowBackedRotatedN72");
         N72_WINDOW_BACKED_ROT_FN.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+        let f = window.gl_get_proc_address("glGetRenderbufferWindowBackedRotatedN72");
+        N72_WINDOW_BACKED_GET_FN.store(f as usize, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
