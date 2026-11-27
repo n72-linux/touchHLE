@@ -402,8 +402,8 @@ extern "aapcs" fn n72_strstr(haystack: *const libc::c_char, needle: *const libc:
 
 // Direct wide-char string/memory calls (`wchar_t` = `i32` on Darwin ARM,
 // matching `src/libc/wchar.rs`). Implemented directly rather than calling
-// musl's `wcs*` so behavior matches `GenericChar<i32>` and null pointers
-// with `n == 0` are safe.
+// musl's `wcs*` so behavior matches `GenericChar<i32>` and bounded (`n`-taking)
+// calls with `n == 0` do not dereference null pointers.
 extern "aapcs" fn n72_wcslen(s: *const i32) -> usize {
     let mut i = 0;
     unsafe {
@@ -481,7 +481,10 @@ extern "aapcs" fn n72_wcsncpy(dst: *mut i32, src: *const i32, n: usize) -> *mut 
 }
 extern "aapcs" fn n72_wmemmove(dst: *mut i32, src: *const i32, n: usize) -> *mut i32 {
     if n != 0 {
-        unsafe { libc::memmove(dst.cast(), src.cast(), n * std::mem::size_of::<i32>()) };
+        let bytes = n
+            .checked_mul(std::mem::size_of::<i32>())
+            .expect("wmemmove size overflow");
+        unsafe { libc::memmove(dst.cast(), src.cast(), bytes) };
     }
     dst
 }

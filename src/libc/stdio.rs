@@ -18,6 +18,7 @@ use crate::Environment;
 
 use crate::environment::{ThreadBlock, ThreadId};
 use crate::libc::mach::time::mach_absolute_time;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -26,12 +27,74 @@ use std::io::Write;
 pub mod printf;
 
 const EOF: i32 = -1;
+const READ_BUF_SIZE: usize = 8192;
+
+#[derive(Default)]
+struct FxBuildHasher;
+
+struct FxHasher(u64);
+
+impl std::hash::BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> Self::Hasher {
+        FxHasher(0)
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u8(b);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0.rotate_left(5) ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517cc1b727220a95);
+    }
+}
 
 struct FILEHostObject {
     /// `ungetc()` implementation
     pushbacks: Vec<u8>,
     lock_count: u32,
     owning_thread: Option<ThreadId>,
+    buf_enabled: bool,
+    read_buf: Vec<u8>,
+    buf_pos: usize,
+    buf_len: usize,
+    cached_pos: Option<off_t>,
+}
+
+impl FILEHostObject {
+    fn new(buf_enabled: bool) -> Self {
+        Self {
+            pushbacks: Vec::new(),
+            lock_count: 0,
+            owning_thread: None,
+            buf_enabled,
+            read_buf: Vec::new(),
+            buf_pos: 0,
+            buf_len: 0,
+            cached_pos: if buf_enabled { Some(0) } else { None },
+        }
+    }
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -44,7 +107,7 @@ unsafe impl SafeRead for FILE {}
 
 #[derive(Default)]
 pub struct State {
-    file_streams: HashMap<MutPtr<FILE>, FILEHostObject>,
+    file_streams: HashMap<MutPtr<FILE>, FILEHostObject, FxBuildHasher>,
 }
 impl State {
     fn get_mut(env: &mut Environment) -> &mut Self {
@@ -56,20 +119,35 @@ impl State {
         file_ptr: MutPtr<FILE>,
     ) -> &mut FILEHostObject {
         let FILE { fd } = mem.read(file_ptr);
-        if matches!(fd, STDIN_FILENO | STDOUT_FILENO | STDERR_FILENO)
-            && !self.file_streams.contains_key(&file_ptr)
-        {
-            // Special case, need to do a lazy creation of host object
-            self.file_streams.insert(
-                file_ptr,
-                FILEHostObject {
-                    pushbacks: Vec::new(),
-                    lock_count: 0,
-                    owning_thread: None,
-                },
-            );
+        match self.file_streams.entry(file_ptr) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                assert!(matches!(fd, STDIN_FILENO | STDOUT_FILENO | STDERR_FILENO));
+                // Special case, need to do a lazy creation of host object
+                entry.insert(FILEHostObject::new(false))
+            }
         }
-        self.file_streams.get_mut(&file_ptr).unwrap()
+    }
+    #[inline]
+    fn get_checked_mut(
+        &mut self,
+        mem: &mut Mem,
+        file_ptr: MutPtr<FILE>,
+        current_thread: ThreadId,
+    ) -> (posix_io::FileDescriptor, &mut FILEHostObject) {
+        let FILE { fd } = mem.read(file_ptr);
+        let obj = match self.file_streams.entry(file_ptr) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                assert!(matches!(fd, STDIN_FILENO | STDOUT_FILENO | STDERR_FILENO));
+                entry.insert(FILEHostObject::new(false))
+            }
+        };
+        assert!(
+            (obj.owning_thread.is_none() && obj.lock_count == 0)
+                || obj.owning_thread == Some(current_thread)
+        );
+        (fd, obj)
     }
     pub(crate) fn try_acquire_file_object_lock(
         &mut self,
@@ -93,24 +171,44 @@ impl State {
     }
 }
 
-fn _touchHLE_check_file_object_lock(env: &mut Environment, file_ptr: MutPtr<FILE>) {
-    let FILEHostObject {
-        lock_count,
-        owning_thread,
-        ..
-    } = env
+fn _touchHLE_check_file_object_lock(
+    env: &mut Environment,
+    file_ptr: MutPtr<FILE>,
+) -> posix_io::FileDescriptor {
+    let current_thread = env.current_thread;
+    let (fd, _) = env
         .libc_state
         .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    // Technically, stdio should use same locking mechanism as `flockfile`.
-    // Practically, we don't need that as we are single host threaded.
-    //
-    // Still, an app can call a stdio function with currently
-    // `flockfile`-locked FILE object from another thread.
-    // TODO: handle indirect locking
-    assert!(
-        (owning_thread.is_none() && *lock_count == 0) || *owning_thread == Some(env.current_thread)
-    );
+        .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+    fd
+}
+
+/// Rewind any unread buffered bytes back to the OS fd and drop cached position.
+fn sync_and_discard_read_buf(
+    env: &mut Environment,
+    file_ptr: MutPtr<FILE>,
+    disable_buf: bool,
+) -> posix_io::FileDescriptor {
+    let current_thread = env.current_thread;
+    let (fd, rem) = {
+        let (fd, obj) = env
+            .libc_state
+            .stdio
+            .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+        let rem = obj.buf_len - obj.buf_pos;
+        obj.buf_pos = 0;
+        obj.buf_len = 0;
+        obj.cached_pos = None;
+        if disable_buf {
+            obj.buf_enabled = false;
+        }
+        (fd, rem)
+    };
+    if rem > 0 {
+        let res = posix_io::lseek(env, fd, -(rem as off_t), SEEK_CUR);
+        assert!(res >= 0);
+    }
+    fd
 }
 
 #[allow(non_camel_case_types)]
@@ -157,14 +255,9 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
         fd => {
             let res = env.mem.alloc_and_write(FILE { fd });
             assert!(!State::get_mut(env).file_streams.contains_key(&res));
-            State::get_mut(env).file_streams.insert(
-                res,
-                FILEHostObject {
-                    pushbacks: Vec::new(),
-                    lock_count: 0,
-                    owning_thread: None,
-                },
-            );
+            State::get_mut(env)
+                .file_streams
+                .insert(res, FILEHostObject::new(flags == O_RDONLY));
             res
         }
     }
@@ -180,9 +273,13 @@ fn fread(
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
+    let current_thread = env.current_thread;
 
     if item_size == 0 {
+        _ = env
+            .libc_state
+            .stdio
+            .get_checked_mut(&mut env.mem, file_ptr, current_thread);
         return 0;
     }
 
@@ -190,40 +287,114 @@ fn fread(
     // really does expect you to just multiply and divide like this, with no
     // attempt being made to ensure a whole number are read or written!
     let mut total_size = item_size.checked_mul(n_items).unwrap();
-    let FILEHostObject {
-        ref mut pushbacks, ..
-    } = env
+    let (fd, obj) = env
         .libc_state
         .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    let already_read = if !pushbacks.is_empty() {
-        let to_copy = pushbacks.len().min(total_size as usize);
-        let offset = pushbacks.len() - to_copy;
+        .get_checked_mut(&mut env.mem, file_ptr, current_thread);
 
-        _ = &pushbacks[offset..].reverse();
-        let to_copy: GuestUSize = to_copy.try_into().unwrap();
+    let mut already_read = if !obj.pushbacks.is_empty() {
+        let to_copy = obj.pushbacks.len().min(total_size as usize);
+        let offset = obj.pushbacks.len() - to_copy;
+
+        _ = &obj.pushbacks[offset..].reverse();
+        let to_copy_u32: GuestUSize = to_copy.try_into().unwrap();
         env.mem
-            .bytes_at_mut(buffer.cast(), to_copy)
-            .copy_from_slice(&pushbacks[offset..]);
-        pushbacks.truncate(offset);
+            .bytes_at_mut(buffer.cast(), to_copy_u32)
+            .copy_from_slice(&obj.pushbacks[offset..]);
+        obj.pushbacks.truncate(offset);
 
-        if total_size == to_copy {
-            return total_size;
+        if total_size == to_copy_u32 {
+            return total_size / item_size;
         }
-        total_size -= to_copy;
+        total_size -= to_copy_u32;
         let ptr: MutPtr<u8> = buffer.cast();
-        buffer = (ptr + to_copy).cast();
-        to_copy
+        buffer = (ptr + to_copy_u32).cast();
+        to_copy_u32
     } else {
         0
     };
-    let FILE { fd } = env.mem.read(file_ptr);
-    match posix_io::read(env, fd, buffer, total_size) {
-        // TODO: ferror() support.
-        -1 => already_read / item_size,
-        bytes_read => {
-            let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
-            (bytes_read + already_read) / item_size
+
+    if obj.buf_enabled {
+        let avail = obj.buf_len - obj.buf_pos;
+        if avail > 0 && total_size > 0 {
+            let to_copy = avail.min(total_size as usize);
+            env.mem
+                .bytes_at_mut(buffer.cast(), to_copy as GuestUSize)
+                .copy_from_slice(&obj.read_buf[obj.buf_pos..obj.buf_pos + to_copy]);
+            obj.buf_pos += to_copy;
+            if let Some(p) = &mut obj.cached_pos {
+                *p += to_copy as off_t;
+            }
+            let to_copy_u32 = to_copy as GuestUSize;
+            already_read += to_copy_u32;
+            total_size -= to_copy_u32;
+            if total_size == 0 {
+                return already_read / item_size;
+            }
+            let ptr: MutPtr<u8> = buffer.cast();
+            buffer = (ptr + to_copy_u32).cast();
+        }
+        if total_size == 0 {
+            return already_read / item_size;
+        }
+        obj.buf_pos = 0;
+        obj.buf_len = 0;
+        if (total_size as usize) < READ_BUF_SIZE {
+            let mut buf = std::mem::take(&mut obj.read_buf);
+            if buf.len() < READ_BUF_SIZE {
+                buf.resize(READ_BUF_SIZE, 0);
+            }
+            match posix_io::read_host(env, fd, &mut buf) {
+                Err(()) => {
+                    let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+                    obj.read_buf = buf;
+                    obj.cached_pos = None;
+                    return already_read / item_size;
+                }
+                Ok(n) => {
+                    let to_copy = n.min(total_size as usize);
+                    if to_copy > 0 {
+                        env.mem
+                            .bytes_at_mut(buffer.cast(), to_copy as GuestUSize)
+                            .copy_from_slice(&buf[..to_copy]);
+                    }
+                    let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+                    obj.read_buf = buf;
+                    obj.buf_pos = to_copy;
+                    obj.buf_len = n;
+                    if let Some(p) = &mut obj.cached_pos {
+                        *p += to_copy as off_t;
+                    }
+                    return (already_read + to_copy as GuestUSize) / item_size;
+                }
+            }
+        }
+        match posix_io::read(env, fd, buffer, total_size) {
+            // TODO: ferror() support.
+            -1 => {
+                if let Some(obj) = env.libc_state.stdio.file_streams.get_mut(&file_ptr) {
+                    obj.cached_pos = None;
+                }
+                already_read / item_size
+            }
+            bytes_read => {
+                let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
+                if let Some(obj) = env.libc_state.stdio.file_streams.get_mut(&file_ptr) {
+                    if let Some(p) = &mut obj.cached_pos {
+                        *p += bytes_read as off_t;
+                    }
+                }
+                (bytes_read + already_read) / item_size
+            }
+        }
+    } else {
+        match posix_io::read(env, fd, buffer, total_size) {
+            // TODO: ferror() support.
+            -1 => already_read / item_size,
+            bytes_read => {
+                let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
+                (bytes_read + already_read) / item_size
+            }
         }
     }
 }
@@ -232,33 +403,63 @@ fn fgetc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
-    let FILEHostObject {
-        ref mut pushbacks, ..
-    } = env
+    let current_thread = env.current_thread;
+    let (fd, obj) = env
         .libc_state
         .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    if let Some(pushback) = pushbacks.pop() {
+        .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+    if let Some(pushback) = obj.pushbacks.pop() {
+        obj.cached_pos = None;
         let new_offset = posix_io::lseek(env, fd, 1, SEEK_CUR);
         assert!(new_offset > 0); // TODO: handle error
         return pushback.into();
     }
 
-    let buffer = env.mem.alloc(1);
-
-    match posix_io::read(env, fd, buffer, 1) {
-        -1 => EOF,
-        bytes_read => {
-            let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
-            if bytes_read < 1 {
-                EOF
-            } else {
-                let buf: MutPtr<u8> = buffer.cast();
-                env.mem.read(buf) as i32
+    if obj.buf_enabled {
+        if obj.buf_pos < obj.buf_len {
+            let b = obj.read_buf[obj.buf_pos];
+            obj.buf_pos += 1;
+            if let Some(p) = &mut obj.cached_pos {
+                *p += 1;
             }
+            return b as i32;
         }
+        obj.buf_pos = 0;
+        obj.buf_len = 0;
+        let mut buf = std::mem::take(&mut obj.read_buf);
+        if buf.len() < READ_BUF_SIZE {
+            buf.resize(READ_BUF_SIZE, 0);
+        }
+        return match posix_io::read_host(env, fd, &mut buf) {
+            Err(()) => {
+                let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+                obj.read_buf = buf;
+                obj.cached_pos = None;
+                EOF
+            }
+            Ok(0) => {
+                let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+                obj.read_buf = buf;
+                EOF
+            }
+            Ok(n) => {
+                let b = buf[0];
+                let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+                obj.read_buf = buf;
+                obj.buf_pos = 1;
+                obj.buf_len = n;
+                if let Some(p) = &mut obj.cached_pos {
+                    *p += 1;
+                }
+                b as i32
+            }
+        };
+    }
+
+    let mut one = [0u8; 1];
+    match posix_io::read_host(env, fd, &mut one) {
+        Err(()) | Ok(0) => EOF,
+        Ok(_) => one[0] as i32,
     }
 }
 
@@ -276,8 +477,7 @@ fn __srget(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
 
 fn ungetc(env: &mut Environment, c: i32, file_ptr: MutPtr<FILE>) -> i32 {
     assert!(c != EOF); // TODO
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
+    let fd = sync_and_discard_read_buf(env, file_ptr, false);
     let curr_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
     assert!(curr_offset > 0);
     // Note: successful seeking clears EOF indicator
@@ -362,8 +562,7 @@ fn fwrite(
         return 0;
     }
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
+    let fd = sync_and_discard_read_buf(env, file_ptr, false);
 
     let total_size = item_size.checked_mul(n_items).unwrap();
 
@@ -408,20 +607,54 @@ fn fseeko(env: &mut Environment, file_ptr: MutPtr<FILE>, offset: off_t, whence: 
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
-
     assert!([SEEK_SET, SEEK_CUR, SEEK_END].contains(&whence));
-    match posix_io::lseek(env, fd, offset, whence) {
+    let current_thread = env.current_thread;
+    let (fd, rem, buf_enabled) = {
+        let (fd, obj) = env
+            .libc_state
+            .stdio
+            .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+        if obj.buf_enabled && obj.pushbacks.is_empty() && (whence == SEEK_CUR || whence == SEEK_SET)
+        {
+            if let Some(cur_logical) = obj.cached_pos {
+                let target = if whence == SEEK_CUR {
+                    cur_logical.checked_add(offset)
+                } else {
+                    Some(offset)
+                };
+                if let Some(t) = target {
+                    let buf_start = cur_logical - (obj.buf_pos as off_t);
+                    let buf_end = buf_start + (obj.buf_len as off_t);
+                    if t >= buf_start && t <= buf_end {
+                        obj.buf_pos = (t - buf_start) as usize;
+                        obj.cached_pos = Some(t);
+                        posix_io::clearerr(env, fd);
+                        return 0;
+                    }
+                }
+            }
+        }
+        let rem = (obj.buf_len - obj.buf_pos) as off_t;
+        obj.buf_pos = 0;
+        obj.buf_len = 0;
+        obj.cached_pos = None;
+        (fd, rem, obj.buf_enabled)
+    };
+
+    let adj_offset = if whence == SEEK_CUR {
+        offset.checked_sub(rem).unwrap()
+    } else {
+        offset
+    };
+
+    match posix_io::lseek(env, fd, adj_offset, whence) {
         -1 => -1,
-        _cur_pos => {
-            let FILEHostObject {
-                ref mut pushbacks, ..
-            } = env
-                .libc_state
-                .stdio
-                .get_file_host_obj_mut(&mut env.mem, file_ptr);
-            pushbacks.clear();
+        cur_pos => {
+            let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+            obj.pushbacks.clear();
+            if buf_enabled {
+                obj.cached_pos = Some(cur_pos);
+            }
             0
         }
     }
@@ -435,9 +668,25 @@ fn ftello(env: &mut Environment, file_ptr: MutPtr<FILE>) -> off_t {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
-    posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR)
+    let current_thread = env.current_thread;
+    let (fd, rem) = {
+        let (fd, obj) = env
+            .libc_state
+            .stdio
+            .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+        if obj.pushbacks.is_empty() {
+            if let Some(pos) = obj.cached_pos {
+                return pos;
+            }
+        }
+        (fd, (obj.buf_len - obj.buf_pos) as off_t)
+    };
+    let res = posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR);
+    if res == -1 {
+        -1
+    } else {
+        res - rem
+    }
 }
 
 fn rewind(env: &mut Environment, file_ptr: MutPtr<FILE>) {
@@ -459,18 +708,7 @@ fn fclose(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
         return EOF;
     }
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-
-    // This is needed in order to force lazy instantiation
-    // of stdin-like host object.
-    // Why the app may need to close stdin?
-    // The answer is left as an exercise for the reader.
-    _ = env
-        .libc_state
-        .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-
-    let FILE { fd } = env.mem.read(file_ptr);
+    let fd = _touchHLE_check_file_object_lock(env, file_ptr);
     if matches!(fd, STDIN_FILENO | STDOUT_FILENO | STDERR_FILENO) {
         log!(
             "Warning! fclose({:?}) is called for standard descriptor {}.",
@@ -503,20 +741,27 @@ fn fsetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: ConstPtr<fpos_t>)
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
+    let current_thread = env.current_thread;
+    let (fd, buf_enabled) = {
+        let (fd, obj) = env
+            .libc_state
+            .stdio
+            .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+        obj.buf_pos = 0;
+        obj.buf_len = 0;
+        obj.cached_pos = None;
+        (fd, obj.buf_enabled)
+    };
 
     let res = posix_io::lseek(env, fd, env.mem.read(pos), SEEK_SET);
     if res == -1 {
         -1
     } else {
-        let FILEHostObject {
-            ref mut pushbacks, ..
-        } = env
-            .libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr);
-        pushbacks.clear();
+        let obj = env.libc_state.stdio.file_streams.get_mut(&file_ptr).unwrap();
+        obj.pushbacks.clear();
+        if buf_enabled {
+            obj.cached_pos = Some(res);
+        }
         0
     }
 }
@@ -525,10 +770,7 @@ fn fgetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: MutPtr<fpos_t>) -
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
-
-    let res = posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR);
+    let res = ftello(env, file_ptr);
     if res == -1 {
         return -1;
     }
@@ -540,17 +782,26 @@ fn feof(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
-    posix_io::eof(env, fd)
+    let current_thread = env.current_thread;
+    let (fd, has_buffered) = {
+        let (fd, obj) = env
+            .libc_state
+            .stdio
+            .get_checked_mut(&mut env.mem, file_ptr, current_thread);
+        (fd, !obj.pushbacks.is_empty() || obj.buf_pos < obj.buf_len)
+    };
+    if has_buffered {
+        0
+    } else {
+        posix_io::eof(env, fd)
+    }
 }
 
 fn clearerr(env: &mut Environment, file_ptr: MutPtr<FILE>) {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
+    let fd = _touchHLE_check_file_object_lock(env, file_ptr);
     posix_io::clearerr(env, fd)
 }
 
@@ -558,8 +809,7 @@ fn fflush(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
+    let fd = sync_and_discard_read_buf(env, file_ptr, false);
     posix_io::fflush(env, fd)
 }
 
@@ -612,7 +862,7 @@ fn setbuf(env: &mut Environment, file_ptr: MutPtr<FILE>, buf: ConstPtr<u8>) {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    _touchHLE_check_file_object_lock(env, file_ptr);
+    sync_and_discard_read_buf(env, file_ptr, true);
 
     assert!(buf.is_null());
     log!(
@@ -637,14 +887,9 @@ fn tmpfile(env: &mut Environment) -> MutPtr<FILE> {
         fd => {
             let res = env.mem.alloc_and_write(FILE { fd });
             assert!(!State::get_mut(env).file_streams.contains_key(&res));
-            State::get_mut(env).file_streams.insert(
-                res,
-                FILEHostObject {
-                    pushbacks: Vec::new(),
-                    lock_count: 0,
-                    owning_thread: None,
-                },
-            );
+            State::get_mut(env)
+                .file_streams
+                .insert(res, FILEHostObject::new(false));
             res
         }
     };
@@ -658,9 +903,7 @@ fn tmpfile(env: &mut Environment) -> MutPtr<FILE> {
 // POSIX-specific functions
 
 fn fileno(env: &mut Environment, file_ptr: MutPtr<FILE>) -> posix_io::FileDescriptor {
-    _touchHLE_check_file_object_lock(env, file_ptr);
-    let FILE { fd } = env.mem.read(file_ptr);
-    fd
+    sync_and_discard_read_buf(env, file_ptr, true)
 }
 
 fn flockfile(env: &mut Environment, file_ptr: MutPtr<FILE>) {

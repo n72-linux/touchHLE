@@ -322,6 +322,34 @@ pub fn read(
     }
 }
 
+/// Host-buffer read helper for `stdio` buffering (no partial-read warning spam).
+pub(crate) fn read_host(
+    env: &mut Environment,
+    fd: FileDescriptor,
+    dst: &mut [u8],
+) -> Result<usize, ()> {
+    set_errno(env, 0);
+    let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
+        return Err(());
+    };
+    match file.file.read(dst) {
+        Ok(bytes_read) => {
+            if bytes_read == 0 && !dst.is_empty() {
+                file.reached_eof = true;
+            }
+            Ok(bytes_read)
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::IsADirectory {
+                set_errno(env, EISDIR);
+                Ok(0)
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
 pub fn pread(
     env: &mut Environment,
     fd: FileDescriptor,
